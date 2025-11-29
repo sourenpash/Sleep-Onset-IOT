@@ -19,7 +19,7 @@
 const char* WIFI_SSID     = "Mehrali68";
 const char* WIFI_PASSWORD = "4165659393";
 
-const char* SERVER_IP     = "10.0.0.31";
+const char* SERVER_IP     = "10.0.0.32";
 const uint16_t SERVER_PORT = 5000;
 
 const char* NODE_ID       = "door";        // JSON node name

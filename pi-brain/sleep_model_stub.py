@@ -1,36 +1,46 @@
 """
 sleep_model_stub.py
 
-Unified sleep + environment model:
+Logistic-regression-based sleep model + self-tuning ODEs + camera override.
 
-- Logistic regression hazard model:
-    p_sleep_soon = P(sleep within BASE_HORIZON_MIN minutes | features)
+Pipeline:
 
-- First-order ODE environment model for:
-    - temperature at bed
-    - humidity at bed
-  with optional online tuning of k_temp, k_hum.
+- Training:
+    * training_data.csv rows come from camera labels + context (window/bedside/
+      door/weather) built in brain_server.py.
+    * We map camera labels -> binary target (SLEEP vs AWAKE).
+    * We train a logistic regression in pure numpy.
+    * We save weights + normalization stats to logs/sleep_model.json.
 
-- compute_sleep_plan(recent_features):
-    Used by brain_server. Combines:
-      * logistic hazard
-      * simple heuristic state (AWAKE / WINDING_DOWN / ASLEEP)
-      * environment time-to-target estimates
-      * simple target setpoints
+- Dynamics (ODEs):
+    * We maintain first-order ODE time constants for:
+        dT/dt = -(T - T_out) / tau_T
+        dH/dt = -(H - H_out) / tau_H
+      where T is indoor bed temp, H is indoor bed humidity, and T_out/H_out come
+      from the weather node.
+    * Each call, we estimate a fresh tau_T, tau_H from recent temperature/
+      humidity history and update them via an exponential moving average.
+    * ODE is used to estimate how long it will take to reach target temp /
+      humidity (cooldown_time_s).
 
-- train_on_night_csv(csv_path):
-    Offline training from a CSV log (e.g. fake_night.csv or real night logs).
+- Inference (compute_sleep_plan):
+    * Load trained logistic regression model if present.
+    * Extract current feature vector (window/bedside/door/weather sensors).
+    * Estimate dynamics (tau_T, tau_H) and predicted cooldown_time_s.
+    * Predict a FUTURE feature vector at t = cooldown_time_s using the ODE
+      for temp_bed_c and hum_bed_pct (others left as current).
+    * Run logistic regression on that future feature vector -> p_sleep.
+    * Combine with latest camera label:
+        - camera strongly says "in bed / sleeping" => override to SLEEP
+        - else, state = SLEEP if p_sleep >= 0.5, else AWAKE.
+    * Return a rich plan dict.
 
-- Optional ONLINE learning:
-    - Logistic: if ENABLE_ONLINE_LOGISTIC is True we do an SGD step on each
-      call using either an explicit label message or a label derived from
-      the camera node.
-    - Env ODE: if ENABLE_ENV_ONLINE_TUNING is True, we update k_temp/k_hum
-      from successive temp/humidity samples and persist periodically.
+This file is intentionally self-contained and uses only numpy + stdlib.
 """
 
 from __future__ import annotations
 
+import csv
 import json
 import math
 import time
@@ -39,895 +49,796 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-# ---------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Feature configuration
+# ---------------------------------------------------------------------------
 
-# Base hazard horizon for training / interpretation (minutes)
-BASE_HORIZON_MIN = 30.0
+# These names must match BOTH:
+#   - columns in training_data.csv
+#   - sensor keys used on the ESP32 nodes
+FEATURE_NAMES = [
+    # Window node
+    "temp_win_c",
+    "hum_win_pct",
+    "light_win_lux",
 
-# Paths for model persistence
-MODEL_PATH = Path(__file__).with_name("sleep_model_state.json")
-ENV_MODEL_PATH = Path(__file__).with_name("env_model_state.json")
+    # Bedside node
+    "temp_bed_c",
+    "hum_bed_pct",
+    "lux_bed",
+    "light_bed_lux",
 
-# Online learning toggles
-ENABLE_ONLINE_LOGISTIC = True        # enable online SGD updates
-ENABLE_ENV_ONLINE_TUNING = True      # enable k_temp/k_hum online tuning
+    # Door node
+    "temp_door_c",
+    "hum_door_pct",
+    "mic_v",
+    "light_door_v",
 
-# For logistic online learning (small learning rate)
-ONLINE_LR = 1e-3
+    # Outdoor weather
+    "temp_outdoor_c",
+    "hum_outdoor_pct",
+]
 
-# Node name + key for explicit online labels (optional)
-# If you push a message like:
-#   {"node": "__sleep_label", "sensors": {"y_sleep_within_horizon": 1}}
-# into recent_features, we'll use it as an online training target.
-LABEL_NODE_NAME = "__sleep_label"
-LABEL_KEY = "y_sleep_within_horizon"
+# Mapping from feature_name -> (node_name, sensor_key)
+FEATURE_SPEC: Dict[str, Tuple[str, str]] = {
+    "temp_win_c": ("window", "temp_win_c"),
+    "hum_win_pct": ("window", "hum_win_pct"),
+    "light_win_lux": ("window", "light_win_lux"),
 
-# For env model online tuning
-ENV_SAVE_INTERVAL_SEC = 60.0  # don't hammer disk
-ENV_ETA = 0.05                # how fast to blend new k samples
-ENV_K_TEMP_MIN = 1.0 / 240.0  # time constant between ~4h and...
-ENV_K_TEMP_MAX = 1.0 / 5.0    # ...5 minutes
-ENV_K_HUM_MIN = 1.0 / 240.0
-ENV_K_HUM_MAX = 1.0 / 5.0
+    "temp_bed_c": ("bedside", "temp_bed_c"),
+    "hum_bed_pct": ("bedside", "hum_bed_pct"),
+    "lux_bed": ("bedside", "lux_bed"),
+    "light_bed_lux": ("bedside", "light_bed_lux"),
 
-# State for env online tuning (module-level)
-_last_env_sample: Dict[str, Optional[float]] = {
-    "ts": None,
-    "temp_bed": None,
-    "temp_out": None,
-    "hum_bed": None,
-    "hum_out": None,
+    "temp_door_c": ("door", "temp_door_c"),
+    "hum_door_pct": ("door", "hum_door_pct"),
+    "mic_v": ("door", "mic_v"),
+    "light_door_v": ("door", "light_door_v"),
+
+    "temp_outdoor_c": ("weather", "temp_outdoor_c"),
+    "hum_outdoor_pct": ("weather", "hum_outdoor_pct"),
 }
-_last_env_save_time: float = 0.0
 
+# Model + dynamics paths
+LOG_DIR = Path("logs")
+DEFAULT_MODEL_PATH = LOG_DIR / "sleep_model.json"
+DYN_STATE_PATH = LOG_DIR / "sleep_dynamics.json"
 
-# ---------------------------------------------------------------------
-# Utility: safe sigmoid
-# ---------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Comfort targets and ODE parameters
+# ---------------------------------------------------------------------------
 
-def _sigmoid(x: float) -> float:
-    if x >= 0:
-        z = math.exp(-x)
-        return 1.0 / (1.0 + z)
-    else:
-        z = math.exp(x)
-        return z / (1.0 + z)
+TARGET_TEMP_C = 21.0       # comfort temperature at bed (°C)
+TARGET_HUM_PCT = 45.0      # comfort RH (%)
+MIN_TAU_S = 60.0           # min plausible time constant (1 min)
+MAX_TAU_S = 3 * 3600.0     # max (3 hours)
+DYN_EMA_ALPHA = 0.2        # how fast we update tau estimates
+MAX_PREDICTION_WINDOW_S = 2 * 3600.0  # clamp horizon to 2h
 
+# ---------------------------------------------------------------------------
+# Camera label → binary target (sleep vs awake)
+# ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------
-# Logistic model persistence
-# ---------------------------------------------------------------------
-
-def _load_logistic_model(n_features: int) -> Tuple[np.ndarray, float]:
+def _label_to_target(label: str) -> Optional[int]:
     """
-    Load logistic regression parameters from JSON, or initialize zeros.
+    Map a camera label string to binary target:
 
-    Model: p = sigmoid(w^T x + b)
+        1 = "sleep / in bed"
+        0 = "awake / out of bed"
+
+    You can extend this as you refine camera classes.
     """
-    if MODEL_PATH.exists():
-        try:
-            with MODEL_PATH.open("r") as f:
-                state = json.load(f)
-            w_list = state.get("w", [])
-            b_val = state.get("b", 0.0)
-            w = np.array(w_list, dtype=float)
-            b = float(b_val)
-            if w.shape[0] != n_features:
-                # feature dimension changed; re-init
-                print("[SLEEP_MODEL] Feature size changed; re-initializing logistic model.")
-                w = np.zeros(n_features, dtype=float)
-                b = 0.0
-        except Exception as e:
-            print(f"[SLEEP_MODEL] Warning: failed to load logistic model: {e}")
-            w = np.zeros(n_features, dtype=float)
-            b = 0.0
-    else:
-        w = np.zeros(n_features, dtype=float)
-        b = 0.0
+    if not label:
+        return None
+    u = str(label).upper()
 
-    return w, b
+    # Sleepy / in-bed variants
+    if "SLEEP" in u or "IN_BED" in u or "LYING" in u or "LAYING" in u:
+        return 1
 
+    # Awake variants
+    if "AWAKE" in u or "OUT_OF_BED" in u or "STAND" in u or "UP" in u or "ROOM" in u:
+        return 0
 
-def _save_logistic_model(w: np.ndarray, b: float) -> None:
-    state = {"w": w.tolist(), "b": float(b)}
-    try:
-        with MODEL_PATH.open("w") as f:
-            json.dump(state, f, indent=2)
-        print("[SLEEP_MODEL] Saved logistic model to", MODEL_PATH)
-    except Exception as e:
-        print(f"[SLEEP_MODEL] Warning: failed to save logistic model: {e}")
+    # Unknown label → skip for training
+    return None
 
+# ---------------------------------------------------------------------------
+# TRAINING API (logistic regression)
+# ---------------------------------------------------------------------------
 
-def _online_update_logistic(w: np.ndarray, b: float,
-                            x: np.ndarray, y: float,
-                            lr: float = ONLINE_LR) -> Tuple[np.ndarray, float]:
+def train_model_from_csv(
+    csv_path: Path,
+    model_out_path: Path = DEFAULT_MODEL_PATH,
+    min_conf: float = 0.5,
+) -> bool:
     """
-    Single SGD step for logistic regression on one labeled example (x, y).
-    """
-    z = float(np.dot(w, x) + b)
-    p = _sigmoid(z)
-    err = p - y
-    w = w - lr * err * x
-    b = b - lr * err
-    return w, b
+    Train a logistic regression model from training_data.csv.
 
+    - Inputs: FEATURE_NAMES as features.
+    - Target: camera label mapped by _label_to_target.
+    - Filters:
+        * rows where label can't be mapped
+        * rows where label_conf < min_conf (if provided)
+    - Handles NaNs via per-feature mean imputation + standardization.
 
-def _find_online_label(recent_features: List[Dict[str, Any]]) -> Optional[float]:
-    """
-    Look for a special label node in recent_features of the form:
-
+    Saves model JSON:
       {
-        "node": "__sleep_label",
-        "sensors": {"y_sleep_within_horizon": 0 or 1}
+        "feature_names": [...],
+        "mean": [...],
+        "std": [...],
+        "weights": [...],
+        "bias": float,
+        "trained_at": <ts>,
+        "n_samples": int
       }
 
-    Return the label as float if found, else None.
+    Returns True if training succeeded and model was saved, False otherwise.
     """
-    for f in reversed(recent_features):
-        if f.get("node") == LABEL_NODE_NAME:
-            sensors = f.get("sensors", {})
-            if LABEL_KEY in sensors:
+    if not csv_path.exists():
+        print(f"[MODEL] No training CSV at {csv_path}, cannot train.")
+        return False
+
+    X_rows: List[List[float]] = []
+    y_rows: List[int] = []
+
+    try:
+        with csv_path.open("r", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                label_str = row.get("label", "")
+                target = _label_to_target(label_str)
+                if target is None:
+                    continue
+
+                conf_raw = row.get("label_conf", "")
                 try:
-                    return float(sensors[LABEL_KEY])
+                    conf_val = float(conf_raw) if conf_raw != "" else float("nan")
                 except Exception:
-                    return None
-    return None
+                    conf_val = float("nan")
 
+                if not math.isnan(conf_val) and conf_val < min_conf:
+                    continue
 
-# ---------------------------------------------------------------------
-# Environment first-order ODE model
-# ---------------------------------------------------------------------
+                feats: List[float] = []
+                for name in FEATURE_NAMES:
+                    v_raw = row.get(name, "")
+                    if v_raw is None or str(v_raw).strip() == "":
+                        feats.append(float("nan"))
+                        continue
+                    try:
+                        feats.append(float(v_raw))
+                    except Exception:
+                        feats.append(float("nan"))
 
-class EnvModel:
-    """
-    Very simple first-order environment model for temperature and humidity.
+                X_rows.append(feats)
+                y_rows.append(int(target))
 
-    We assume:
-      dT/dt = -k_T (T - T_out)
-      dH/dt = -k_H (H - H_out)
-
-    For now, k_T and k_H are scalars per system. With ENABLE_ENV_ONLINE_TUNING,
-    we adapt them online from observed trajectories.
-    """
-
-    def __init__(self, k_temp: float = 1.0 / 45.0, k_hum: float = 1.0 / 60.0):
-        """
-        k_temp, k_hum are approx inverse time constants in 1/min.
-
-        Example:
-          k_temp = 1/45 ~ time constant ~45 minutes
-          k_hum  = 1/60 ~ time constant ~60 minutes
-        """
-        self.k_temp = k_temp
-        self.k_hum = k_hum
-
-    def estimate_time_to_target_temp(
-        self,
-        T0: float,
-        T_out: float,
-        T_target: float,
-    ) -> float:
-        """
-        Estimate time in minutes to reach T_target, using continuous-time
-        solution of first-order system:
-
-          T(t) = T_out + (T0 - T_out) * exp(-k_temp * t)
-
-        Solve for t such that T(t) = T_target:
-
-          (T_target - T_out)/(T0 - T_out) = exp(-k_temp * t)
-          t = -1/k_temp * ln(ratio)
-        """
-        if self.k_temp <= 0.0:
-            return float("inf")
-
-        denom = (T0 - T_out)
-        if abs(denom) < 0.1:
-            # No usable gradient (room already near outside temp)
-            return 0.0
-
-        num = (T_target - T_out)
-        ratio = num / denom
-        # If ratio not in (0,1), target not reachable in simple model
-        if ratio <= 0.0 or ratio >= 1.0:
-            return float("inf")
-
-        t_min = -math.log(ratio) / self.k_temp
-        if t_min < 0.0:
-            t_min = 0.0
-        return t_min
-
-    def estimate_time_to_target_hum(
-        self,
-        H0: float,
-        H_out: float,
-        H_target: float,
-    ) -> float:
-        """
-        Same idea as temperature, but for humidity.
-        """
-        if self.k_hum <= 0.0:
-            return float("inf")
-
-        denom = (H0 - H_out)
-        if abs(denom) < 0.1:
-            return 0.0
-
-        num = (H_target - H_out)
-        ratio = num / denom
-        if ratio <= 0.0 or ratio >= 1.0:
-            return float("inf")
-
-        t_min = -math.log(ratio) / self.k_hum
-        if t_min < 0.0:
-            t_min = 0.0
-        return t_min
-
-
-def _load_env_model() -> EnvModel:
-    """
-    Load environment model parameters (k_temp, k_hum) from JSON,
-    or initialize defaults if not present.
-    """
-    if ENV_MODEL_PATH.exists():
-        try:
-            with ENV_MODEL_PATH.open("r") as f:
-                state = json.load(f)
-            k_temp = float(state.get("k_temp", 1.0 / 45.0))
-            k_hum = float(state.get("k_hum", 1.0 / 60.0))
-            return EnvModel(k_temp=k_temp, k_hum=k_hum)
-        except Exception as e:
-            print(f"[SLEEP_MODEL] Warning: failed to load env model: {e}")
-    # defaults
-    return EnvModel()
-
-
-def _save_env_model(env_model: EnvModel) -> None:
-    state = {"k_temp": env_model.k_temp, "k_hum": env_model.k_hum}
-    try:
-        with ENV_MODEL_PATH.open("w") as f:
-            json.dump(state, f, indent=2)
-        print("[SLEEP_MODEL] Saved env model to", ENV_MODEL_PATH)
     except Exception as e:
-        print(f"[SLEEP_MODEL] Warning: failed to save env model: {e}")
+        print(f"[MODEL] Error reading training CSV: {e}")
+        return False
 
+    if not X_rows:
+        print("[MODEL] No usable training rows after filtering; aborting training.")
+        return False
 
-def _update_env_model_online(env_model: EnvModel, dbg: Dict[str, Any], ts: float) -> None:
-    """
-    Online adaptation of k_temp / k_hum from successive samples.
+    X = np.asarray(X_rows, dtype=float)  # (N, D)
+    y = np.asarray(y_rows, dtype=float)  # (N,)
 
-    We look at bed & window temp/hum at consecutive times, estimate an
-    effective exponential decay rate k_sample, and blend it into k_temp/k_hum.
-    """
-    global _last_env_sample, _last_env_save_time
-
-    temp_bed = dbg["temp_bed"]
-    hum_bed = dbg["hum_bed"]
-    temp_out = dbg["temp_win"]
-    hum_out = dbg["hum_win"]
-
-    # First call: just store and return
-    if _last_env_sample["ts"] is None:
-        _last_env_sample = {
-            "ts": ts,
-            "temp_bed": temp_bed,
-            "temp_out": temp_out,
-            "hum_bed": hum_bed,
-            "hum_out": hum_out,
-        }
-        return
-
-    ts_prev = _last_env_sample["ts"]
-    dt_sec = ts - ts_prev
-    if dt_sec <= 1.0:
-        # too close in time; skip
-        return
-
-    dt_min = dt_sec / 60.0
-
-    T_prev = _last_env_sample["temp_bed"]
-    T_out_prev = _last_env_sample["temp_out"]
-    H_prev = _last_env_sample["hum_bed"]
-    H_out_prev = _last_env_sample["hum_out"]
-
-    # -------- temp update --------
-    try:
-        denom_T = (T_prev - T_out_prev)
-        if abs(denom_T) > 0.3:
-            ratio_T = (temp_bed - temp_out) / denom_T
-            # ratio should be between 0 and 1 for decay towards T_out
-            if 0.01 < ratio_T < 0.99:
-                k_sample_T = -math.log(ratio_T) / dt_min
-                # clamp to reasonable band
-                k_sample_T = max(ENV_K_TEMP_MIN, min(ENV_K_TEMP_MAX, k_sample_T))
-                env_model.k_temp = (
-                    (1.0 - ENV_ETA) * env_model.k_temp + ENV_ETA * k_sample_T
-                )
-    except Exception:
-        pass
-
-    # -------- humidity update --------
-    try:
-        denom_H = (H_prev - H_out_prev)
-        if abs(denom_H) > 0.5:
-            ratio_H = (hum_bed - hum_out) / denom_H
-            if 0.01 < ratio_H < 0.99:
-                k_sample_H = -math.log(ratio_H) / dt_min
-                k_sample_H = max(ENV_K_HUM_MIN, min(ENV_K_HUM_MAX, k_sample_H))
-                env_model.k_hum = (
-                    (1.0 - ENV_ETA) * env_model.k_hum + ENV_ETA * k_sample_H
-                )
-    except Exception:
-        pass
-
-    # Store current as last
-    _last_env_sample = {
-        "ts": ts,
-        "temp_bed": temp_bed,
-        "temp_out": temp_out,
-        "hum_bed": hum_bed,
-        "hum_out": hum_out,
-    }
-
-    # Persist occasionally
-    now = time.time()
-    if now - _last_env_save_time > ENV_SAVE_INTERVAL_SEC:
-        _save_env_model(env_model)
-        _last_env_save_time = now
-
-
-# ---------------------------------------------------------------------
-# Helpers: recent_features parsing
-# ---------------------------------------------------------------------
-
-def _find_latest_node(
-    recent_features: List[Dict[str, Any]],
-    node_name: str,
-) -> Optional[Dict[str, Any]]:
-    for f in reversed(recent_features):
-        if f.get("node") == node_name and "sensors" in f:
-            return f
-    return None
-
-
-def _safe_float(sensors: Dict[str, Any], key: str, default: float) -> float:
-    val = sensors.get(key, default)
-    try:
-        return float(val)
-    except Exception:
-        return default
-
-
-# ---------------------------------------------------------------------
-# Feature extraction for logistic model (now includes camera)
-# ---------------------------------------------------------------------
-
-def _extract_features(
-    recent_features: List[Dict[str, Any]],
-) -> Tuple[np.ndarray, Dict[str, Any]]:
-    """
-    Build a feature vector x_t from recent_features.
-
-    Features (in order):
-      0:  bias = 1
-      1:  temp_bed
-      2:  hum_bed
-      3:  light_bed
-      4:  temp_grad (bed - window)
-      5:  hum_grad  (bed - window)
-      6:  dT_bed_dt (stub 0)
-      7:  dL_bed_dt (stub 0)
-      8:  noise_level
-      9:  motion_index
-     10: in_bed_flag (heuristic from light & motion, OR camera)
-     11: time_since_in_bed (stub 0)
-     12: time_of_day_sin
-     13: time_of_day_cos
-     14: cam_in_room_flag
-     15: cam_in_bed_flag
-     16: cam_asleep_like_flag
-    """
-    now = time.time()
-
-    bedside = _find_latest_node(recent_features, "bedside")
-    window = _find_latest_node(recent_features, "window")
-    camera = _find_latest_node(recent_features, "camera")
-
-    # Defaults
-    temp_bed = 23.0
-    hum_bed = 40.0
-    light_bed = 100.0
-    noise_level = 0.5
-    motion_index = 0.5
-
-    temp_win = 23.0
-    hum_win = 40.0
-
-    cam_in_room = 0.0
-    cam_in_bed = 0.0
-    cam_asleep_like = 0.0
-
-    # Bedside sensors
-    if bedside is not None:
-        s = bedside.get("sensors", {})
-        temp_bed = _safe_float(s, "temp_bed_c", temp_bed)
-        hum_bed = _safe_float(s, "hum_bed_pct", hum_bed)
-        # Real-time nodes may send "lux_bed"; training scripts may use "light_bed_lux".
-        light_bed = _safe_float(s, "lux_bed", light_bed)
-        light_bed = _safe_float(s, "light_bed_lux", light_bed)
-        noise_level = _safe_float(s, "noise_level", noise_level)
-        motion_index = _safe_float(s, "motion_index", motion_index)
-
-    # Window sensors
-    if window is not None:
-        s = window.get("sensors", {})
-        temp_win = _safe_float(s, "temp_win_c", temp_win)
-        hum_win = _safe_float(s, "hum_win_pct", hum_win)
-
-    # Camera features as direct inputs
-    if camera is not None:
-        s = camera.get("sensors", {})
-        # Option A: numeric cam_state_code
-        if "cam_state_code" in s:
-            try:
-                code = int(s["cam_state_code"])
-            except Exception:
-                code = 0
-            cam_in_room = 1.0 if code == 0 else 0.0
-            cam_in_bed = 1.0 if code == 1 else 0.0
-            cam_asleep_like = 1.0 if code == 2 else 0.0
-        # Option B: string cam_state
-        elif "cam_state" in s:
-            st = str(s["cam_state"]).upper()
-            cam_in_room = 1.0 if st in ("IN_ROOM", "AWAKE") else 0.0
-            cam_in_bed = 1.0 if st in ("IN_BED", "LYING_IN_BED", "ON_BED") else 0.0
-            cam_asleep_like = 1.0 if st in ("ASLEEP", "SLEEP_LIKE") else 0.0
-        # Option C: probabilistic fields
+    # Impute NaNs with per-feature mean, then standardize
+    means = np.zeros(X.shape[1], dtype=float)
+    stds = np.zeros(X.shape[1], dtype=float)
+    for j in range(X.shape[1]):
+        col = X[:, j]
+        mask = np.isfinite(col)
+        if not np.any(mask):
+            means[j] = 0.0
+            stds[j] = 1.0
+            X[:, j] = 0.0
         else:
-            cam_in_bed = _safe_float(s, "in_bed_prob", cam_in_bed)
-            cam_asleep_like = _safe_float(s, "sleep_like_prob", cam_asleep_like)
+            m = float(col[mask].mean())
+            means[j] = m
+            col_imputed = col.copy()
+            col_imputed[~mask] = m
+            X[:, j] = col_imputed
+            s = float(col_imputed.std())
+            stds[j] = s if s > 1e-6 else 1.0
 
-    temp_grad = temp_bed - temp_win
-    hum_grad = hum_bed - hum_win
+    X_norm = (X - means[None, :]) / stds[None, :]
 
-    # TODO: real derivatives over a short history window
-    dT_bed_dt = 0.0
-    dL_bed_dt = 0.0
+    w, b = _train_logistic_gradient_descent(X_norm, y)
 
-    # Time of day
-    lt = time.localtime(now)
-    tod_hours = lt.tm_hour + lt.tm_min / 60.0
-    angle = 2.0 * math.pi * tod_hours / 24.0
-    tod_sin = math.sin(angle)
-    tod_cos = math.cos(angle)
-
-    # Heuristic in-bed flag:
-    # either camera says "in bed" or (low light & low motion)
-    in_bed_flag = 0.0
-    if cam_in_bed > 0.5:
-        in_bed_flag = 1.0
-    elif light_bed < 60.0 and motion_index < 0.4:
-        in_bed_flag = 1.0
-
-    # Stub: we don't track this explicitly yet
-    time_since_in_bed = 0.0
-
-    feats = np.array(
-        [
-            1.0,
-            temp_bed,
-            hum_bed,
-            light_bed,
-            temp_grad,
-            hum_grad,
-            dT_bed_dt,
-            dL_bed_dt,
-            noise_level,
-            motion_index,
-            in_bed_flag,
-            time_since_in_bed,
-            tod_sin,
-            tod_cos,
-            cam_in_room,
-            cam_in_bed,
-            cam_asleep_like,
-        ],
-        dtype=float,
-    )
-
-    debug = {
-        "temp_bed": temp_bed,
-        "hum_bed": hum_bed,
-        "light_bed": light_bed,
-        "temp_grad": temp_grad,
-        "hum_grad": hum_grad,
-        "noise_level": noise_level,
-        "motion_index": motion_index,
-        "in_bed_flag": in_bed_flag,
-        "time_since_in_bed": time_since_in_bed,
-        "time_of_day_hours": tod_hours,
-        "temp_win": temp_win,
-        "hum_win": hum_win,
-        "cam_in_room": cam_in_room,
-        "cam_in_bed": cam_in_bed,
-        "cam_asleep_like": cam_asleep_like,
+    model = {
+        "feature_names": FEATURE_NAMES,
+        "mean": means.tolist(),
+        "std": stds.tolist(),
+        "weights": w.tolist(),
+        "bias": float(b),
+        "trained_at": time.time(),
+        "n_samples": int(len(y)),
     }
 
-    return feats, debug
+    try:
+        model_out_path.parent.mkdir(parents=True, exist_ok=True)
+        model_out_path.write_text(json.dumps(model))
+        print(
+            f"[MODEL] Trained logistic regression on {len(y)} samples; "
+            f"saved to {model_out_path}"
+        )
+        return True
+    except Exception as e:
+        print(f"[MODEL] Failed to save model to {model_out_path}: {e}")
+        return False
 
 
-# ---------------------------------------------------------------------
-# State classification (AWAKE / WINDING_DOWN / ASLEEP)
-# ---------------------------------------------------------------------
+def _train_logistic_gradient_descent(
+    X: np.ndarray,
+    y: np.ndarray,
+    lr: float = 0.05,
+    n_iter: int = 500,
+) -> Tuple[np.ndarray, float]:
+    """Basic logistic regression training via batch gradient descent."""
+    N, D = X.shape
+    w = np.zeros(D, dtype=float)
+    b = 0.0
 
-def _classify_state_from_sensors(
-    temp_bed: float,
-    hum_bed: float,
-    light_bed: float,
-    noise_level: float,
-    motion_index: float,
-) -> str:
-    LIGHT_LOW = 50.0
-    LIGHT_VERY_LOW = 10.0
-    MOTION_LOW = 0.2
-    NOISE_LOW = 0.3
+    for _ in range(n_iter):
+        z = X @ w + b
+        p = 1.0 / (1.0 + np.exp(-np.clip(z, -40, 40)))
 
-    if (light_bed > LIGHT_LOW) or (motion_index > MOTION_LOW) or (noise_level > NOISE_LOW):
-        return "AWAKE"
-    elif (light_bed < LIGHT_VERY_LOW) and (motion_index < MOTION_LOW) and (noise_level < NOISE_LOW):
-        return "ASLEEP"
-    else:
-        return "WINDING_DOWN"
+        error = p - y  # (N,)
+        grad_w = (X.T @ error) / N
+        grad_b = float(error.mean())
 
+        w -= lr * grad_w
+        b -= lr * grad_b
 
-# ---------------------------------------------------------------------
-# Derive weak labels from camera (for online learning)
-# ---------------------------------------------------------------------
+    return w, b
 
-def _derive_label_from_camera(recent_features: List[Dict[str, Any]]) -> Optional[float]:
-    """
-    Use the latest camera state as a weak label for online learning.
+# ---------------------------------------------------------------------------
+# Model + dynamics loading
+# ---------------------------------------------------------------------------
 
-    Returns:
-        1.0 if clearly asleep,
-        0.0 if clearly awake,
-        None otherwise (ambiguous).
-    """
-    cam = _find_latest_node(recent_features, "camera")
-    if cam is None:
+def _load_model(model_path: Path = DEFAULT_MODEL_PATH) -> Optional[Dict[str, Any]]:
+    if not model_path.exists():
+        print(f"[MODEL] No model file at {model_path}; cannot predict.")
+        return None
+    try:
+        return json.loads(model_path.read_text())
+    except Exception as e:
+        print(f"[MODEL] Failed to load model from {model_path}: {e}")
         return None
 
-    s = cam.get("sensors", {})
 
-    # Option A: numeric state code (e.g. 0=IN_ROOM,1=IN_BED,2=ASLEEP)
-    if "cam_state_code" in s:
+def _load_dyn_state(path: Path = DYN_STATE_PATH) -> Dict[str, Any]:
+    """Load or initialize ODE time constants."""
+    if path.exists():
         try:
-            code = int(s["cam_state_code"])
-        except Exception:
-            return None
-        if code == 2:
-            return 1.0
-        elif code == 0:
-            return 0.0
-        else:
-            return None
+            data = json.loads(path.read_text())
+            return {
+                "tau_temp_s": float(data.get("tau_temp_s", 900.0)),
+                "tau_hum_s": float(data.get("tau_hum_s", 900.0)),
+                "updated_at": float(data.get("updated_at", time.time())),
+            }
+        except Exception as e:
+            print(f"[DYN] Failed to load dynamics state: {e}")
+    # defaults ~15 min time constant
+    return {
+        "tau_temp_s": 900.0,
+        "tau_hum_s": 900.0,
+        "updated_at": time.time(),
+    }
 
-    # Option B: string cam_state
-    if "cam_state" in s:
-        st = str(s["cam_state"]).upper()
-        if st in ("ASLEEP", "SLEEP_LIKE"):
-            return 1.0
-        elif st in ("IN_ROOM", "AWAKE"):
-            return 0.0
-        else:
-            return None
 
-    # Option C: probabilistic fields
-    sleep_like = _safe_float(s, "sleep_like_prob", 0.5)
-    in_bed_prob = _safe_float(s, "in_bed_prob", 0.5)
+def _save_dyn_state(state: Dict[str, Any], path: Path = DYN_STATE_PATH) -> None:
+    state["updated_at"] = time.time()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(state))
+    except Exception as e:
+        print(f"[DYN] Failed to save dynamics state: {e}")
 
-    # Conservative thresholds to avoid noisy labels
-    if sleep_like > 0.9:
-        return 1.0
-    if (sleep_like < 0.1) and (in_bed_prob < 0.3):
-        return 0.0
+# ---------------------------------------------------------------------------
+# Helpers over recent_features
+# ---------------------------------------------------------------------------
 
+def _latest_msg_for_node(
+    recent_features: List[Dict[str, Any]],
+    node_name: str,
+    max_age_sec: float,
+    ref_ts: float,
+) -> Optional[Dict[str, Any]]:
+    """Return latest message for node within max_age_sec of ref_ts."""
+    for msg in reversed(recent_features):
+        if msg.get("node") != node_name:
+            continue
+        ts = msg.get("ts")
+        if not isinstance(ts, (int, float)):
+            continue
+        if ref_ts - ts > max_age_sec:
+            continue
+        return msg
     return None
 
 
-# ---------------------------------------------------------------------
-# Public: compute_sleep_plan (used by brain_server)
-# ---------------------------------------------------------------------
-
-def compute_sleep_plan(recent_features: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _extract_feature_vector_from_recent(
+    recent_features: List[Dict[str, Any]],
+    feature_names: List[str],
+    max_age_sec: float = 120.0,
+) -> Tuple[Optional[np.ndarray], Dict[str, Any]]:
     """
-    Called by brain_server in a loop.
+    Build a feature vector in the same order as feature_names from recent_features.
+
+    Returns:
+      (x, debug_dict) where x is (D,) or None if we have zero information.
+    """
+    if not recent_features:
+        return None, {}
+
+    now = time.time()
+    debug: Dict[str, Any] = {}
+
+    values: List[float] = []
+    any_finite = False
+
+    for fname in feature_names:
+        node, skey = FEATURE_SPEC.get(fname, (None, None))
+        if node is None:
+            values.append(float("nan"))
+            debug[fname] = None
+            continue
+
+        msg = _latest_msg_for_node(recent_features, node, max_age_sec, now)
+        if msg is None:
+            values.append(float("nan"))
+            debug[fname] = None
+            continue
+
+        sensors = msg.get("sensors", {})
+        v = sensors.get(skey)
+        try:
+            fv = float(v)
+        except Exception:
+            fv = float("nan")
+
+        values.append(fv)
+        debug[fname] = fv
+        if math.isfinite(fv):
+            any_finite = True
+
+    if not any_finite:
+        return None, debug
+
+    x = np.asarray(values, dtype=float)
+    return x, debug
+
+
+def _latest_camera_info(
+    recent_features: List[Dict[str, Any]],
+    max_age_sec: float = 60.0,
+) -> Tuple[Optional[str], Optional[float], Optional[float]]:
+    """Return (label, conf, age_s) from latest camera message, or (None, None, None)."""
+    if not recent_features:
+        return None, None, None
+
+    now = time.time()
+    cam_msg = _latest_msg_for_node(recent_features, "camera", max_age_sec, now)
+    if cam_msg is None:
+        return None, None, None
+
+    sensors = cam_msg.get("sensors", {})
+
+    # 1) Try explicit keys first
+    label = (
+        sensors.get("state")
+        or sensors.get("label")
+        or sensors.get("camera_state")
+        or sensors.get("class")
+        or sensors.get("pose")
+        or sensors.get("sleep_state")
+    )
+    conf = (
+        sensors.get("conf")
+        or sensors.get("confidence")
+        or sensors.get("prob")
+        or sensors.get("p")
+        or sensors.get("score")
+    )
+
+    # 2) If still no label, scan for any key that *looks* like a label/state
+    if label is None:
+        for k, v in sensors.items():
+            if not isinstance(v, str):
+                continue
+            kl = k.lower()
+            if any(sub in kl for sub in ["state", "label", "pose", "sleep"]):
+                label = v
+                break
+
+    try:
+        conf_val = float(conf) if conf is not None else None
+    except Exception:
+        conf_val = None
+
+    ts = cam_msg.get("ts", now)
+    try:
+        age = float(now - float(ts))
+    except Exception:
+        age = None
+
+    return label, conf_val, age
+
+# ---------------------------------------------------------------------------
+# Dynamics estimation (ODE time constants)
+# ---------------------------------------------------------------------------
+
+def _extract_time_series(
+    recent_features: List[Dict[str, Any]],
+    node: str,
+    key: str,
+    max_age_sec: float = 1800.0,  # up to 30 min
+) -> List[Tuple[float, float]]:
+    """Return list of (ts, value) for the given node/key within max_age_sec."""
+    series: List[Tuple[float, float]] = []
+    now = time.time()
+    for msg in recent_features:
+        if msg.get("node") != node:
+            continue
+        ts = msg.get("ts")
+        if not isinstance(ts, (int, float)):
+            continue
+        if now - ts > max_age_sec:
+            continue
+        sensors = msg.get("sensors", {})
+        v = sensors.get(key)
+        try:
+            fv = float(v)
+        except Exception:
+            continue
+        series.append((float(ts), fv))
+    series.sort(key=lambda x: x[0])
+    return series
+
+
+def _estimate_tau_from_series(
+    series: List[Tuple[float, float]],
+    eq_series: List[Tuple[float, float]],
+) -> Optional[float]:
+    """
+    Estimate a first-order time constant tau from two-sample dynamics:
+
+      dX/dt = -(X - X_eq) / tau
+
+    Using the last two samples and approximate equilibrium X_eq from weather.
+    """
+    if len(series) < 2 or len(eq_series) == 0:
+        return None
+
+    # last two indoor samples
+    t0, x0 = series[-2]
+    t1, x1 = series[-1]
+    dt = t1 - t0
+    if dt <= 1.0:
+        return None
+
+    # eq value: latest weather
+    eq_ts, x_eq = eq_series[-1]
+
+    diff0 = x0 - x_eq
+    diff1 = x1 - x_eq
+    if diff0 == 0 or diff1 == 0:
+        return None
+    if diff0 * diff1 <= 0:
+        # changed sign (crossed equilibrum) -> unstable for tau estimation
+        return None
+
+    ratio = diff1 / diff0
+    if ratio <= 0:
+        return None
+
+    try:
+        tau = -dt / math.log(ratio)
+    except (ValueError, ZeroDivisionError):
+        return None
+
+    if not math.isfinite(tau):
+        return None
+    if tau < MIN_TAU_S or tau > MAX_TAU_S:
+        return None
+
+    return float(tau)
+
+
+def _update_dyn_state_from_recent(
+    recent_features: List[Dict[str, Any]],
+    dyn_state: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Update tau_temp_s and tau_hum_s based on recent history."""
+    temp_series = _extract_time_series(recent_features, "bedside", "temp_bed_c")
+    hum_series = _extract_time_series(recent_features, "bedside", "hum_bed_pct")
+    temp_out_series = _extract_time_series(recent_features, "weather", "temp_outdoor_c")
+    hum_out_series = _extract_time_series(recent_features, "weather", "hum_outdoor_pct")
+
+    tau_temp = dyn_state.get("tau_temp_s", 900.0)
+    tau_hum = dyn_state.get("tau_hum_s", 900.0)
+
+    tau_temp_hat = _estimate_tau_from_series(temp_series, temp_out_series)
+    if tau_temp_hat is not None:
+        tau_temp = (1.0 - DYN_EMA_ALPHA) * tau_temp + DYN_EMA_ALPHA * tau_temp_hat
+
+    tau_hum_hat = _estimate_tau_from_series(hum_series, hum_out_series)
+    if tau_hum_hat is not None:
+        tau_hum = (1.0 - DYN_EMA_ALPHA) * tau_hum + DYN_EMA_ALPHA * tau_hum_hat
+
+    # clamp
+    tau_temp = float(max(MIN_TAU_S, min(MAX_TAU_S, tau_temp)))
+    tau_hum = float(max(MIN_TAU_S, min(MAX_TAU_S, tau_hum)))
+
+    dyn_state["tau_temp_s"] = tau_temp
+    dyn_state["tau_hum_s"] = tau_hum
+    return dyn_state
+
+
+def _predict_time_to_target(
+    current: Optional[float],
+    target: float,
+    eq_val: Optional[float],
+    tau: float,
+) -> Optional[float]:
+    """
+    Solve for t in a first-order approach to target:
+
+      X(t) = X_eq + (X0 - X_eq) * exp(-t / tau)
+
+    Given X(0)=current, X_eq=eq_val, want X(t)=target.
+
+      t = -tau * ln( (target - X_eq) / (current - X_eq) )
+
+    Returns t (seconds) or None if not solvable.
+    """
+    if current is None or eq_val is None:
+        return None
+    if not (math.isfinite(current) and math.isfinite(eq_val)):
+        return None
+
+    num = target - eq_val
+    den = current - eq_val
+    if den == 0 or num == 0:
+        return 0.0
+    ratio = num / den
+    if ratio <= 0:
+        # target not between current and equilibrium in a clean way
+        return None
+
+    try:
+        t = -tau * math.log(ratio)
+    except (ValueError, ZeroDivisionError):
+        return None
+    if t < 0:
+        return 0.0
+    return float(t)
+
+
+def _predict_env_at_time(
+    current: Optional[float],
+    eq_val: Optional[float],
+    tau: float,
+    t: float,
+) -> Optional[float]:
+    """X(t) = X_eq + (X0 - X_eq) * exp(-t / tau)"""
+    if current is None or eq_val is None:
+        return None
+    if not (math.isfinite(current) and math.isfinite(eq_val)):
+        return None
+    if tau <= 0 or t < 0:
+        return current
+    return float(eq_val + (current - eq_val) * math.exp(-t / tau))
+
+# ---------------------------------------------------------------------------
+# Logistic prediction
+# ---------------------------------------------------------------------------
+
+def _predict_prob_sleep(
+    model: Dict[str, Any],
+    x_raw: np.ndarray,
+) -> float:
+    """
+    Apply normalization + logistic model to a single feature vector x_raw (D,).
+    """
+    means = np.asarray(model["mean"], dtype=float)
+    stds = np.asarray(model["std"], dtype=float)
+    w = np.asarray(model["weights"], dtype=float)
+    b = float(model["bias"])
+
+    x = x_raw.copy()
+    mask = ~np.isfinite(x)
+    if np.any(mask):
+        x[mask] = means[mask]
+
+    std_safe = stds.copy()
+    std_safe[std_safe < 1e-6] = 1.0
+    x_norm = (x - means) / std_safe
+
+    z = float(x_norm @ w + b)
+    z_clip = max(min(z, 40.0), -40.0)
+    p = 1.0 / (1.0 + math.exp(-z_clip))
+    return float(p)
+
+# ---------------------------------------------------------------------------
+# Public API: compute_sleep_plan
+# ---------------------------------------------------------------------------
+
+def compute_sleep_plan(
+    recent_features: List[Dict[str, Any]],
+    model_version: Optional[int] = None,
+    model_path: Path = DEFAULT_MODEL_PATH,
+) -> Dict[str, Any]:
+    """
+    Main "brain" entry point.
 
     Steps:
-      1) Extract features from recent_features (including camera if present).
-      2) Run logistic hazard model to get p_sleep_within_base_horizon.
-      3) Optional: online SGD update from explicit label or camera-derived label.
-      4) Use heuristic to classify current state AWAKE/WINDING_DOWN/ASLEEP.
-      5) Use EnvModel to estimate time to hit temp/humidity targets at the bed,
-         with optional online tuning of k_temp/k_hum.
-      6) Produce a plan dict with state, predicted sleep time, targets, and debug info.
+      1) Load logistic model (if exists).
+      2) Extract current feature vector and debug dict.
+      3) Load & update ODE dynamics (tau_temp_s, tau_hum_s) from recent data.
+      4) Compute ODE-based prediction window (cooldown_time_s) from how long
+         it should take to reach TARGET_TEMP_C and TARGET_HUM_PCT.
+      5) Build a future feature vector at t = cooldown_time_s by projecting
+         temp_bed_c and hum_bed_pct forward using the ODEs.
+      6) Run logistic regression on that future feature vector to get
+         p_sleep_model (if model available).
+      7) Camera label ALWAYS decides global_state when present:
+           - camera → SLEEP label -> global_state = "SLEEP"
+           - camera → AWAKE label -> global_state = "AWAKE"
+         Model is used only as a side-quantity.
+      8) If there is NO camera label, fall back to model / heuristics.
     """
-    now = time.time()
+    # 1) Load model
+    model = _load_model(model_path)
 
-    # 1) Features
-    feats, dbg = _extract_features(recent_features)
-    n_features = feats.shape[0]
+    # 2) Current feature vector
+    x_now, feats_now = _extract_feature_vector_from_recent(recent_features, FEATURE_NAMES)
 
-    # 2) Logistic hazard
-    w, b = _load_logistic_model(n_features)
-    z = float(np.dot(w, feats) + b)
-    p_sleep_soon = _sigmoid(z)  # P(sleep within BASE_HORIZON_MIN)
+    # 3) Load & update dynamics
+    dyn_state = _load_dyn_state()
+    dyn_state = _update_dyn_state_from_recent(recent_features, dyn_state)
+    _save_dyn_state(dyn_state)
 
-    # 3) Optional online update (explicit label OR camera-derived label)
-    if ENABLE_ONLINE_LOGISTIC:
-        # First look for explicit label messages if you ever send them
-        y_label = _find_online_label(recent_features)
+    tau_temp = dyn_state.get("tau_temp_s", 900.0)
+    tau_hum = dyn_state.get("tau_hum_s", 900.0)
 
-        # If none, fall back to auto-derived label from camera
-        if y_label is None:
-            y_label = _derive_label_from_camera(recent_features)
+    # 4) Extract indoor/outdoor T/H for ODE
+    def _get(feats: Dict[str, Any], key: str) -> Optional[float]:
+        v = feats.get(key)
+        try:
+            return float(v)
+        except Exception:
+            return None
 
-        if y_label is not None:
-            w, b = _online_update_logistic(w, b, feats, y_label, lr=ONLINE_LR)
-            _save_logistic_model(w, b)  # persist after online step
+    T_in = _get(feats_now, "temp_bed_c")
+    H_in = _get(feats_now, "hum_bed_pct")
+    T_out = _get(feats_now, "temp_outdoor_c")
+    H_out = _get(feats_now, "hum_outdoor_pct")
 
-    # 4) State heuristic
-    state = _classify_state_from_sensors(
-        temp_bed=dbg["temp_bed"],
-        hum_bed=dbg["hum_bed"],
-        light_bed=dbg["light_bed"],
-        noise_level=dbg["noise_level"],
-        motion_index=dbg["motion_index"],
-    )
+    # ODE-based prediction window
+    t_temp = _predict_time_to_target(T_in, TARGET_TEMP_C, T_out, tau_temp)
+    t_hum = _predict_time_to_target(H_in, TARGET_HUM_PCT, H_out, tau_hum)
 
-    # 5) Environment ODE estimates (time to targets)
-    env_model = _load_env_model()
-
-    temp_bed = dbg["temp_bed"]
-    hum_bed = dbg["hum_bed"]
-    temp_out = dbg["temp_win"]
-    hum_out = dbg["hum_win"]
-
-    # Targets (tune as desired)
-    temp_target = max(18.0, min(24.0, temp_bed - 2.0))
-    hum_target = 45.0
-
-    tau_temp_min = env_model.estimate_time_to_target_temp(
-        T0=temp_bed, T_out=temp_out, T_target=temp_target
-    )
-    tau_hum_min = env_model.estimate_time_to_target_hum(
-        H0=hum_bed, H_out=hum_out, H_target=hum_target
-    )
-
-    # Sanitize env times: if model says "infinite", fall back to base horizon
-    if not math.isfinite(tau_temp_min):
-        tau_temp_min = BASE_HORIZON_MIN
-    if not math.isfinite(tau_hum_min):
-        tau_hum_min = BASE_HORIZON_MIN
-
-    # Optional env online tuning
-    if ENABLE_ENV_ONLINE_TUNING:
-        bedside = _find_latest_node(recent_features, "bedside")
-        ts = float(bedside["ts"]) if bedside and "ts" in bedside else now
-        _update_env_model_online(env_model, dbg, ts)
-
-    # Effective horizon: must be long enough for env to catch up
-    effective_horizon_min = max(BASE_HORIZON_MIN, tau_temp_min, tau_hum_min)
-    if not math.isfinite(effective_horizon_min) or effective_horizon_min <= 0.0:
-        effective_horizon_min = BASE_HORIZON_MIN
-
-    # 6) Predicted sleep time + confidence
-    if state == "ASLEEP":
-        t_sleep_pred = int(now)  # already asleep
-        confidence = max(p_sleep_soon, 0.9)
+    times = [t for t in [t_temp, t_hum] if t is not None]
+    if times:
+        cooldown_time_s = max(times)
+        cooldown_time_s = float(
+            max(0.0, min(MAX_PREDICTION_WINDOW_S, cooldown_time_s))
+        )
     else:
-        # Map p_sleep_soon into an offset inside the effective horizon.
-        if p_sleep_soon >= 0.8:
-            dt_min = 0.5 * effective_horizon_min
-        elif p_sleep_soon >= 0.5:
-            dt_min = 1.0 * effective_horizon_min
+        cooldown_time_s = 0.0
+
+    # 5) Future feature vector at t = cooldown_time_s
+    x_future = None
+    feats_future: Dict[str, Any] = {}
+    if x_now is not None:
+        x_future = x_now.copy()
+        feats_future = dict(feats_now)
+
+        idx_temp_bed = FEATURE_NAMES.index("temp_bed_c")
+        idx_hum_bed = FEATURE_NAMES.index("hum_bed_pct")
+
+        if cooldown_time_s > 0:
+            T_future = _predict_env_at_time(T_in, T_out, tau_temp, cooldown_time_s)
+            H_future = _predict_env_at_time(H_in, H_out, tau_hum, cooldown_time_s)
         else:
-            dt_min = 1.5 * effective_horizon_min
+            T_future = T_in
+            H_future = H_in
 
-        # Final guard: avoid infinities/NaNs causing OverflowError
-        if not math.isfinite(dt_min) or dt_min < 0.0:
-            dt_min = BASE_HORIZON_MIN
+        if T_future is not None:
+            x_future[idx_temp_bed] = T_future
+            feats_future["temp_bed_c"] = T_future
+        if H_future is not None:
+            x_future[idx_hum_bed] = H_future
+            feats_future["hum_bed_pct"] = H_future
 
-        t_sleep_pred = int(now + dt_min * 60.0)
-        confidence = float(p_sleep_soon)
+    # 6) Model probability (if available)
+    p_sleep_model = None
+    model_reason = ""
+    if model is not None and x_future is not None:
+        p_sleep_model = _predict_prob_sleep(model, x_future)
+        state_model = "SLEEP" if p_sleep_model >= 0.5 else "AWAKE"
+        model_reason = (
+            f"logistic on future env (t={cooldown_time_s:.0f}s) "
+            f"p_sleep={p_sleep_model:.3f} → {state_model}"
+        )
+    elif model is None:
+        model_reason = "no trained model yet"
+    elif x_future is None:
+        model_reason = "no usable features from sensors"
 
-    # Light target is low when winding down or asleep
-    if state in ("WINDING_DOWN", "ASLEEP"):
-        max_light_lux = 30.0
+    # 7) Camera label: HARD OVERRIDE OF STATE
+    cam_label, cam_conf, cam_age = _latest_camera_info(recent_features)
+
+    cam_target = _label_to_target(cam_label) if cam_label is not None else None
+
+    # Default state if we have nothing
+    global_state = "AWAKE"
+    p_sleep = 0.0
+    reason_parts: List[str] = []
+
+    # Case A: camera label present → trust it, always
+    if cam_target is not None:
+        if cam_target == 1:
+            global_state = "SLEEP"
+            # align probability with camera; if model exists and is higher, keep it
+            if p_sleep_model is not None:
+                p_sleep = max(0.9, p_sleep_model)
+            else:
+                p_sleep = 0.9
+            reason_parts.append(
+                f"camera label '{cam_label}' mapped to SLEEP (hard override)"
+            )
+        else:  # cam_target == 0
+            global_state = "AWAKE"
+            if p_sleep_model is not None:
+                p_sleep = min(0.1, p_sleep_model)
+            else:
+                p_sleep = 0.1
+            reason_parts.append(
+                f"camera label '{cam_label}' mapped to AWAKE (hard override)"
+            )
+
+        reason_parts.append(
+            f"camera_conf={cam_conf}, camera_age_s={cam_age}"
+        )
+
+        if model_reason:
+            reason_parts.append(f"model: {model_reason}")
+
+    # Case B: no camera label → fall back to model or heuristic
     else:
-        max_light_lux = 150.0
+        if p_sleep_model is not None:
+            p_sleep = p_sleep_model
+            global_state = "SLEEP" if p_sleep_model >= 0.5 else "AWAKE"
+            reason_parts.append(model_reason)
+        else:
+            # nothing to go on
+            global_state = "AWAKE"
+            p_sleep = 0.1
+            reason_parts.append("no camera label and no usable model/features")
 
     plan: Dict[str, Any] = {
-        "state": state,
-        "t_sleep_pred": t_sleep_pred,
-        "confidence": confidence,
-        "targets": {
-            "temp_c": temp_target,
-            "humidity_pct": hum_target,
-            "max_light_lux": max_light_lux,
-        },
-        "debug": {
-            "p_sleep_within_base_horizon": p_sleep_soon,
-            "base_horizon_min": BASE_HORIZON_MIN,
-            "effective_horizon_min": effective_horizon_min,
-            "tau_temp_min": tau_temp_min,
-            "tau_hum_min": tau_hum_min,
-            "features": dbg,
-            "z_raw": z,
-            "k_temp": env_model.k_temp,
-            "k_hum": env_model.k_hum,
-        },
+        "global_state": global_state,
+        "p_sleep": p_sleep,
+        "p_sleep_model": p_sleep_model,
+        "camera_label": cam_label,
+        "camera_conf": cam_conf,
+        "camera_age_s": cam_age,
+        "features_now": feats_now,
+        "features_future": feats_future,
+        "cooldown_time_s": cooldown_time_s,
+        "tau_temp_s": tau_temp,
+        "tau_hum_s": tau_hum,
+        "target_temp_c": TARGET_TEMP_C,
+        "target_hum_pct": TARGET_HUM_PCT,
+        "reason": "; ".join(reason_parts),
     }
+    if model_version is not None:
+        plan["model_version"] = int(model_version)
 
     return plan
-
-
-# ---------------------------------------------------------------------
-# Offline training from a CSV night log (self-learning part)
-# ---------------------------------------------------------------------
-
-def train_on_night_csv(
-    csv_path: Path,
-    lr: float = 1e-3,
-    horizon_min: float = BASE_HORIZON_MIN,
-    epochs: int = 1,
-) -> None:
-    """
-    Offline training of the logistic hazard model from a single-night CSV.
-
-    Expected CSV columns (you can adapt for real logs):
-      minute, cam_state,
-      temp_bed_c, hum_bed_pct, light_bed_lux,
-      noise_level, motion_index,
-      temp_win_c, hum_win_pct
-
-    We:
-      1) Find first minute where cam_state == "ASLEEP" -> t_sleep.
-      2) For each minute t < t_sleep:
-            y_t = 1 if (t_sleep - t) <= horizon_min, else 0
-            x_t = features built from history up to t (like in test script)
-      3) Do SGD on logistic model parameters w, b.
-    """
-    import csv  # local import
-
-    if not csv_path.exists():
-        print(f"[TRAIN] CSV {csv_path} does not exist.")
-        return
-
-    # Load rows
-    rows: List[Dict[str, Any]] = []
-    with csv_path.open("r", newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            row["minute"] = int(row["minute"])
-            row["cam_state"] = row["cam_state"]
-            for k in [
-                "temp_bed_c",
-                "hum_bed_pct",
-                "light_bed_lux",
-                "noise_level",
-                "motion_index",
-                "temp_win_c",
-                "hum_win_pct",
-            ]:
-                row[k] = float(row[k])
-            rows.append(row)
-
-    if not rows:
-        print(f"[TRAIN] CSV {csv_path} is empty.")
-        return
-
-    # Find sleep onset (first ASLEEP in cam_state)
-    t_sleep: Optional[int] = None
-    for row in rows:
-        if row["cam_state"].upper() == "ASLEEP":
-            t_sleep = row["minute"]
-            break
-
-    if t_sleep is None:
-        print("[TRAIN] No ASLEEP state found; nothing to train on.")
-        return
-
-    print(f"[TRAIN] Sleep onset at minute {t_sleep}")
-
-    # Helper: build recent_features structure up to minute index i
-    def build_recent_features(idx: int) -> List[Dict[str, Any]]:
-        rf: List[Dict[str, Any]] = []
-        for j in range(0, idx + 1):
-            r = rows[j]
-            ts = float(r["minute"] * 60)
-            bedside_msg = {
-                "node": "bedside",
-                "ts": ts,
-                "sensors": {
-                    "temp_bed_c": r["temp_bed_c"],
-                    "hum_bed_pct": r["hum_bed_pct"],
-                    "light_bed_lux": r["light_bed_lux"],
-                    "noise_level": r["noise_level"],
-                    "motion_index": r["motion_index"],
-                },
-            }
-            window_msg = {
-                "node": "window",
-                "ts": ts,
-                "sensors": {
-                    "temp_win_c": r["temp_win_c"],
-                    "hum_win_pct": r["hum_win_pct"],
-                },
-            }
-            # Camera node as feature (cam_state)
-            camera_msg = {
-                "node": "camera",
-                "ts": ts,
-                "sensors": {
-                    "cam_state": r["cam_state"],
-                },
-            }
-            rf.append(bedside_msg)
-            rf.append(window_msg)
-            rf.append(camera_msg)
-        return rf
-
-    # Build list of (x_t, y_t)
-    feature_list: List[np.ndarray] = []
-    label_list: List[float] = []
-
-    for idx, row in enumerate(rows):
-        t = row["minute"]
-        if t >= t_sleep:
-            break  # don't train on or after sleep
-
-        dt_to_sleep = t_sleep - t
-        y = 1.0 if dt_to_sleep <= horizon_min else 0.0
-
-        recent_features = build_recent_features(idx)
-        x_vec, _dbg = _extract_features(recent_features)
-
-        feature_list.append(x_vec)
-        label_list.append(y)
-
-    if not feature_list:
-        print("[TRAIN] No training samples found (check t_sleep / horizon).")
-        return
-
-    X = np.stack(feature_list, axis=0)
-    y_arr = np.array(label_list, dtype=float)
-
-    print(f"[TRAIN] {X.shape[0]} samples, {X.shape[1]} features.")
-
-    # Load model or init
-    w, b = _load_logistic_model(n_features=X.shape[1])
-
-    # SGD
-    for ep in range(epochs):
-        total_loss = 0.0
-        # simple online pass in order (you can shuffle if desired)
-        for xi, yi in zip(X, y_arr):
-            z = float(np.dot(w, xi) + b)
-            p = _sigmoid(z)
-            # logistic loss
-            loss = -(yi * math.log(max(p, 1e-8)) +
-                     (1.0 - yi) * math.log(max(1.0 - p, 1e-8)))
-            total_loss += loss
-
-            err = p - yi
-            w -= lr * err * xi
-            b -= lr * err
-
-        avg_loss = total_loss / len(y_arr)
-        print(f"[TRAIN] epoch {ep+1}/{epochs}, avg_loss={avg_loss:.4f}")
-
-    _save_logistic_model(w, b)
-    print("[TRAIN] Done training on", csv_path)

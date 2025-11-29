@@ -1,342 +1,608 @@
-#!/usr/bin/env python3
 """
-Simple live dashboard for the sleep-env project.
+dashboard.py
 
-- Connects to the brain_server TCP endpoint as a "dashboard" client.
-- Shows:
-    * Latest sensor values published by each ESP32 / node
-    * Latest decisions (plan "state") from the brain
-    * Latest config/parameters sent to each node (via plan["config"])
-    * Model version and overall status
-- Tracks a small rolling event log.
+Live dashboard for the sleep-env project.
 
-Assumptions:
-- Brain server is running on HOST:PORT and accepts JSON messages line-by-line.
-- ESP32 nodes send feature messages of the form:
-      {"node": "bedside", "ts": ..., "sensors": {...}}
-- Brain sends plan messages of the form:
-      {"type": "plan", "node": "...", "state": "...",
-       "model_version": N, "config": { ...optional... }}
+Tabs:
+  1) Overview
+     - Current global sleep state / probabilities.
+     - Latest per-node sensor values (window / bedside / door / camera / weather).
+  2) Model Internals
+     - Features fed into logistic regression (current + ODE-predicted future).
+     - Logistic regression output p_sleep_model.
+     - ODE parameters (tau_temp_s, tau_hum_s, cooldown_time_s, targets).
+     - Training/model status (version, # training samples).
 
-Adjust HOST/PORT as needed to match your network_server setup.
+Data sources (all written by brain_server.py):
+  - logs/sensor_log.csv       : flattened sensor features by node.
+  - logs/plan_log.jsonl       : one JSON sleep plan per line.
+  - logs/model_meta.json      : model_version + trained_on_samples.
+  - logs/training_data.csv    : camera-labelled training rows.
+
+This dashboard is read-only: it does NOT send any commands back to the ESP32s
+yet. Calibration / remote control could be built on top of this.
 """
 
+from __future__ import annotations
+
+import csv
 import json
-import socket
-import threading
 import time
-from collections import defaultdict, deque
-from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
-import tkinter as tk
-from tkinter import ttk
-
+import PySimpleGUI as sg
 
 # ---------------------------------------------------------------------------
-# Config: where to connect
+# Paths
 # ---------------------------------------------------------------------------
 
-HOST = "127.0.0.1"   # brain server IP (Pi or PC)
-PORT = 5000          # must match SERVER_PORT used by ESP32s
+LOG_DIR = Path("logs")
+SENSOR_LOG_FILE = LOG_DIR / "sensor_log.csv"
+PLAN_LOG_FILE = LOG_DIR / "plan_log.jsonl"
+MODEL_META_FILE = LOG_DIR / "model_meta.json"
+TRAIN_DATA_FILE = LOG_DIR / "training_data.csv"
 
+REFRESH_INTERVAL_SEC = 2.0
 
-# ---------------------------------------------------------------------------
-# Shared state model
-# ---------------------------------------------------------------------------
+# Same feature names as sleep_model_stub.py
+FEATURE_NAMES = [
+    "temp_win_c",
+    "hum_win_pct",
+    "light_win_lux",
+    "temp_bed_c",
+    "hum_bed_pct",
+    "lux_bed",
+    "light_bed_lux",
+    "temp_door_c",
+    "hum_door_pct",
+    "mic_v",
+    "light_door_v",
+    "temp_outdoor_c",
+    "hum_outdoor_pct",
+]
 
-@dataclass
-class NodeState:
-    node: str
-    last_seen: float = 0.0
-    last_sensors: Dict[str, Any] = field(default_factory=dict)
-    last_plan_state: str = ""
-    last_plan_time: float = 0.0
-    last_config: Dict[str, Any] = field(default_factory=dict)
-
-    @property
-    def status(self) -> str:
-        if self.last_seen <= 0:
-            return "never seen"
-        age = time.time() - self.last_seen
-        if age < 15:
-            return "online"
-        elif age < 60:
-            return f"stale ({int(age)}s)"
-        else:
-            return f"offline ({int(age)}s)"
-
-
-@dataclass
-class DashboardState:
-    nodes: Dict[str, NodeState] = field(default_factory=dict)
-    model_version: int = 0
-    connected: bool = False
-    last_connect_error: str = ""
-    last_message_time: float = 0.0
-    log: deque = field(default_factory=lambda: deque(maxlen=100))
-
-
-STATE = DashboardState()
-STATE_LOCK = threading.Lock()
-
-
-def get_or_create_node(node_name: str) -> NodeState:
-    with STATE_LOCK:
-        if node_name not in STATE.nodes:
-            STATE.nodes[node_name] = NodeState(node=node_name)
-        return STATE.nodes[node_name]
-
-
-def log_event(msg: str) -> None:
-    with STATE_LOCK:
-        ts = time.strftime("%H:%M:%S", time.localtime())
-        STATE.log.appendleft(f"[{ts}] {msg}")
-
+FEATURE_DISPLAY_NAMES: Dict[str, str] = {
+    "temp_win_c": "Window temperature (°C)",
+    "hum_win_pct": "Window humidity (%)",
+    "light_win_lux": "Window light (lux)",
+    "temp_bed_c": "Bedside temperature (°C)",
+    "hum_bed_pct": "Bedside humidity (%)",
+    "lux_bed": "Bedside light level (lux)",
+    "light_bed_lux": "Bedside light (lux, alt key)",
+    "temp_door_c": "Door area temperature (°C)",
+    "hum_door_pct": "Door area humidity (%)",
+    "mic_v": "Door microphone (V)",
+    "light_door_v": "Door area light (V)",
+    "temp_outdoor_c": "Outdoor temperature (°C)",
+    "hum_outdoor_pct": "Outdoor humidity (%)",
+}
 
 # ---------------------------------------------------------------------------
-# Network client thread
+# Helpers to read logs
 # ---------------------------------------------------------------------------
 
-def network_loop() -> None:
-    global STATE
-    while True:
-        try:
-            log_event("Connecting to brain server...")
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(5.0)
-            sock.connect((HOST, PORT))
-            sock.settimeout(None)
-
-            with STATE_LOCK:
-                STATE.connected = True
-                STATE.last_connect_error = ""
-
-            # Send a hello message like the ESP32s do
-            hello = {"type": "hello", "node": "dashboard"}
-            sock.sendall((json.dumps(hello) + "\n").encode("utf-8"))
-            log_event("Connected and sent dashboard hello")
-
-            buffer = ""
-            while True:
-                data = sock.recv(4096)
-                if not data:
-                    raise ConnectionError("Socket closed by server")
-                buffer += data.decode("utf-8", errors="ignore")
-
-                # Split on newline; assume one JSON message per line
-                while "\n" in buffer:
-                    line, buffer = buffer.split("\n", 1)
-                    line = line.strip()
-                    if not line:
-                        continue
-                    _handle_incoming_json(line)
-
-        except Exception as e:
-            with STATE_LOCK:
-                STATE.connected = False
-                STATE.last_connect_error = str(e)
-            log_event(f"Connection error: {e!r}")
-            time.sleep(5)  # retry delay
+def _safe_float(x: Any) -> Optional[float]:
+    try:
+        if x is None or x == "":
+            return None
+        return float(x)
+    except Exception:
+        return None
 
 
-def _handle_incoming_json(line: str) -> None:
-    with STATE_LOCK:
-        STATE.last_message_time = time.time()
+def read_latest_sensor_rows() -> Dict[str, Dict[str, Any]]:
+    """
+    Read sensor_log.csv and return latest row per node.
+
+    Returns:
+        {
+          "bedside": {"ts": ..., "sensors": {"temp_bed_c": ..., ...}},
+          "window": {...},
+          "door": {...},
+          "camera": {...},
+          "weather": {...},
+          ...
+        }
+    """
+    if not SENSOR_LOG_FILE.exists():
+        return {}
+
+    latest_by_node: Dict[str, Dict[str, Any]] = {}
+
+    with SENSOR_LOG_FILE.open("r", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            node = row.get("node", "unknown")
+            ts = _safe_float(row.get("ts"))
+            if ts is None:
+                continue
+            # Always keep the newest row per node
+            prev = latest_by_node.get(node)
+            if prev is not None and _safe_float(prev.get("ts")) is not None:
+                if ts <= _safe_float(prev.get("ts")):
+                    continue
+
+            # Build sensors dict from s_<name> columns
+            sensors: Dict[str, Any] = {}
+            for k, v in row.items():
+                if not isinstance(k, str):
+                    continue
+                if not k.startswith("s_"):
+                    continue
+                name = k[2:]  # drop "s_"
+                sensors[name] = _safe_float(v)
+
+            latest_by_node[node] = {
+                "ts": ts,
+                "sensors": sensors,
+            }
+
+    return latest_by_node
+
+
+def read_latest_plan() -> Optional[Dict[str, Any]]:
+    """Return the last JSON object from plan_log.jsonl, or None."""
+    if not PLAN_LOG_FILE.exists():
+        return None
+
+    last_line = None
+    with PLAN_LOG_FILE.open("r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            last_line = line
+
+    if last_line is None:
+        return None
 
     try:
-        msg = json.loads(line)
-    except json.JSONDecodeError:
-        log_event(f"Failed to parse JSON: {line[:80]}...")
-        return
+        return json.loads(last_line)
+    except Exception:
+        return None
 
-    node = msg.get("node", "unknown")
 
-    # Feature message? (has 'sensors')
-    if "sensors" in msg:
-        ns = get_or_create_node(node)
-        sensors = msg.get("sensors", {})
-        with STATE_LOCK:
-            ns.last_seen = msg.get("ts", time.time())
-            ns.last_sensors = sensors
-        log_event(f"Feature from {node}: {list(sensors.keys())}")
+def read_model_meta() -> Dict[str, Any]:
+    """Load model_meta.json, or defaults if missing."""
+    if not MODEL_META_FILE.exists():
+        return {
+            "version": 0,
+            "trained_on_samples": 0,
+            "updated_at": None,
+        }
+    try:
+        data = json.loads(MODEL_META_FILE.read_text())
+    except Exception:
+        data = {}
+    return {
+        "version": int(data.get("version", 0)),
+        "trained_on_samples": int(data.get("trained_on_samples", 0)),
+        "updated_at": data.get("updated_at"),
+    }
 
-    # Plan message? (has 'type' == 'plan' or 'state' field)
-    if msg.get("type") == "plan" or "state" in msg:
-        ns = get_or_create_node(node)
-        state = msg.get("state", "")
-        cfg = msg.get("config", {})
 
-        with STATE_LOCK:
-            ns.last_plan_state = state
-            ns.last_plan_time = time.time()
-            if isinstance(cfg, dict):
-                ns.last_config = cfg.copy()
-            mv = msg.get("model_version")
-            if isinstance(mv, int):
-                STATE.model_version = mv
+def read_training_stats() -> Dict[str, Any]:
+    """
+    Very small summary of training_data.csv:
+      - n_rows
+      - last_label
+      - last_ts
+    """
+    if not TRAIN_DATA_FILE.exists():
+        return {
+            "n_rows": 0,
+            "last_label": None,
+            "last_ts": None,
+        }
 
-        log_event(f"Plan for {node}: state={state}, cfg_keys={list(cfg.keys())}")
+    n = 0
+    last_label = None
+    last_ts = None
 
+    with TRAIN_DATA_FILE.open("r", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            n += 1
+            last_label = row.get("label", last_label)
+            ts_raw = row.get("ts_label")
+            ts_val = _safe_float(ts_raw)
+            if ts_val is not None:
+                last_ts = ts_val
+
+    return {
+        "n_rows": n,
+        "last_label": last_label,
+        "last_ts": last_ts,
+    }
 
 # ---------------------------------------------------------------------------
-# Tkinter GUI
+# Layout helpers
 # ---------------------------------------------------------------------------
 
-class DashboardGUI:
-    def __init__(self, root: tk.Tk) -> None:
-        self.root = root
-        self.root.title("Sleep-Env Dashboard")
+def make_overview_tab_layout() -> List[List[Any]]:
+    # Global state summary
+    global_frame = [
+        [
+            sg.Text("Current time:", size=(14, 1)),
+            sg.Text("?", key="-OV_NOW-", size=(24, 1)),
+        ],
+        [
+            sg.Text("Global State:", size=(14, 1)),
+            sg.Text("?", key="-OV_GLOBAL_STATE-", size=(12, 1), text_color="yellow"),
+        ],
+        [
+            sg.Text("p_sleep (final):", size=(14, 1)),
+            sg.Text("?", key="-OV_P_SLEEP-", size=(12, 1)),
+        ],
+        [
+            sg.Text("p_sleep_model:", size=(14, 1)),
+            sg.Text("?", key="-OV_P_SLEEP_MODEL-", size=(12, 1)),
+        ],
+        [
+            sg.Text("Camera label:", size=(14, 1)),
+            sg.Text("?", key="-OV_CAM_LABEL-", size=(20, 1)),
+        ],
+        [
+            sg.Text("Camera conf:", size=(14, 1)),
+            sg.Text("?", key="-OV_CAM_CONF-", size=(12, 1)),
+        ],
+    ]
 
-        self._build_ui()
-        self._schedule_update()
+    node_frame = [
+        [sg.Text("Window node")],
+        [sg.Text("Temp in (°C):"), sg.Text("?", key="-OV_WIN_TEMP_IN-")],
+        [sg.Text("Hum in (%):"), sg.Text("?", key="-OV_WIN_HUM_IN-")],
+        [sg.Text("Temp out (°C):"), sg.Text("?", key="-OV_WIN_TEMP_OUT-")],
+        [sg.Text("Hum out (%):"), sg.Text("?", key="-OV_WIN_HUM_OUT-")],
+        [sg.Text("Light (lux):"), sg.Text("?", key="-OV_WIN_LIGHT-")],
+        [sg.HorizontalSeparator()],
+        [sg.Text("Bedside node")],
+        [sg.Text("Temp (°C):"), sg.Text("?", key="-OV_BED_TEMP-")],
+        [sg.Text("Hum (%):"), sg.Text("?", key="-OV_BED_HUM-")],
+        [sg.Text("Light (lux):"), sg.Text("?", key="-OV_BED_LIGHT-")],
+        [sg.HorizontalSeparator()],
+        [sg.Text("Door node")],
+        [sg.Text("Temp (°C):"), sg.Text("?", key="-OV_DOOR_TEMP-")],
+        [sg.Text("Hum (%):"), sg.Text("?", key="-OV_DOOR_HUM-")],
+        [sg.Text("Mic (V):"), sg.Text("?", key="-OV_DOOR_MIC-")],
+        [sg.Text("Light (V):"), sg.Text("?", key="-OV_DOOR_LIGHT-")],
+    ]
 
-    def _build_ui(self) -> None:
-        # Top summary frame
-        summary_frame = ttk.LabelFrame(self.root, text="Brain Status")
-        summary_frame.pack(fill="x", padx=8, pady=4)
-
-        self.lbl_connection = ttk.Label(summary_frame, text="Connection: unknown")
-        self.lbl_connection.pack(anchor="w", padx=4, pady=2)
-
-        self.lbl_model_version = ttk.Label(summary_frame, text="Model version: 0")
-        self.lbl_model_version.pack(anchor="w", padx=4, pady=2)
-
-        self.lbl_last_msg = ttk.Label(summary_frame, text="Last message: -")
-        self.lbl_last_msg.pack(anchor="w", padx=4, pady=2)
-
-        # Node status frame
-        nodes_frame = ttk.LabelFrame(self.root, text="Nodes")
-        nodes_frame.pack(fill="both", expand=True, padx=8, pady=4)
-
-        # Treeview: one row per node
-        cols = ("status", "plan_state", "last_seen", "sensors", "config")
-        self.tree = ttk.Treeview(
-            nodes_frame,
-            columns=cols,
-            show="headings",
-            height=8,
-        )
-        self.tree.heading("status", text="Status")
-        self.tree.heading("plan_state", text="Plan state")
-        self.tree.heading("last_seen", text="Last seen")
-        self.tree.heading("sensors", text="Last sensors")
-        self.tree.heading("config", text="Last config")
-
-        self.tree.column("status", width=100, anchor="w")
-        self.tree.column("plan_state", width=120, anchor="w")
-        self.tree.column("last_seen", width=120, anchor="w")
-        self.tree.column("sensors", width=300, anchor="w")
-        self.tree.column("config", width=300, anchor="w")
-
-        self.tree.pack(fill="both", expand=True, padx=4, pady=4)
-
-        # Event log
-        log_frame = ttk.LabelFrame(self.root, text="Event log")
-        log_frame.pack(fill="both", expand=False, padx=8, pady=4)
-
-        self.txt_log = tk.Text(log_frame, height=10, wrap="none")
-        self.txt_log.pack(fill="both", expand=True, padx=4, pady=4)
-        self.txt_log.configure(state="disabled", font=("Consolas", 9))
-
-    def _schedule_update(self) -> None:
-        self._update_ui()
-        # update every 500 ms
-        self.root.after(500, self._schedule_update)
-
-    def _update_ui(self) -> None:
-        # Snapshot state under lock
-        with STATE_LOCK:
-            connected = STATE.connected
-            last_err = STATE.last_connect_error
-            model_version = STATE.model_version
-            last_msg_time = STATE.last_message_time
-            nodes_copy = {name: ns for name, ns in STATE.nodes.items()}
-            log_lines = list(STATE.log)
-
-        # --- Summary labels ---
-        if connected:
-            conn_text = "Connection: CONNECTED"
-        else:
-            if last_err:
-                conn_text = f"Connection: DISCONNECTED ({last_err})"
-            else:
-                conn_text = "Connection: DISCONNECTED"
-        self.lbl_connection.configure(text=conn_text)
-
-        self.lbl_model_version.configure(
-            text=f"Model version: {model_version}"
-        )
-
-        if last_msg_time > 0:
-            age = time.time() - last_msg_time
-            self.lbl_last_msg.configure(
-                text=f"Last message: {int(age)}s ago"
-            )
-        else:
-            self.lbl_last_msg.configure(text="Last message: -")
-
-        # --- Nodes table ---
-        # Rebuild tree for simplicity
-        for item in self.tree.get_children():
-            self.tree.delete(item)
-
-        for name, ns in sorted(nodes_copy.items(), key=lambda kv: kv[0]):
-            # Format last seen
-            if ns.last_seen > 0:
-                t_str = time.strftime("%H:%M:%S", time.localtime(ns.last_seen))
-            else:
-                t_str = "-"
-
-            # Sensors / config compressed into key:value; only first few
-            sensors_str = ", ".join(
-                f"{k}={v}"
-                for k, v in list(ns.last_sensors.items())[:6]
-            )
-            config_str = ", ".join(
-                f"{k}={v}"
-                for k, v in list(ns.last_config.items())[:6]
-            )
-
-            self.tree.insert(
+    env_frame = [
+        [sg.Text("Outdoor (weather node)")],
+        [sg.Text("Temp (°C):"), sg.Text("?", key="-OV_OUT_TEMP-")],
+        [sg.Text("Hum (%):"), sg.Text("?", key="-OV_OUT_HUM-")],
+        [sg.HorizontalSeparator()],
+        [sg.Text("Camera node")],
+        [sg.Text("Raw sensors dict:")],
+        [
+            sg.Multiline(
                 "",
-                "end",
-                values=(
-                    ns.status,
-                    ns.last_plan_state or "-",
-                    t_str,
-                    sensors_str or "-",
-                    config_str or "-",
-                ),
-                text=name,
+                key="-OV_CAM_RAW-",
+                size=(30, 5),
+                disabled=True,
             )
+        ],
+    ]
 
-        # Label row headings as node names (Treeview doesn't show "text" in headings mode,
-        # so we can set tags/values, but simplest is just to visually map via sensors column).
-        # If you want node name visible, you can add a "node" column too.
+    layout = [
+        [
+            sg.Frame("Sleep plan", global_frame, pad=(5, 5), expand_x=True),
+        ],
+        [
+            sg.Frame(
+                "Nodes (window / bedside / door)",
+                node_frame,
+                pad=(5, 5),
+            ),
+            sg.Frame("Weather + camera", env_frame, pad=(5, 5)),
+        ],
+    ]
+    return layout
 
-        # --- Event log ---
-        self.txt_log.configure(state="normal")
-        self.txt_log.delete("1.0", "end")
-        for line in log_lines:
-            self.txt_log.insert("end", line + "\n")
-        self.txt_log.see("end")
-        self.txt_log.configure(state="disabled")
 
+def make_model_tab_layout() -> List[List[Any]]:
+    # Features list
+    feature_rows = []
+    for name in FEATURE_NAMES:
+        disp = FEATURE_DISPLAY_NAMES.get(name, name)
+        feature_rows.append(
+            [
+                sg.Text(disp + ":", size=(28, 1)),
+                sg.Text("?", key=f"-MOD_FEAT_NOW_{name}-", size=(12, 1)),
+                sg.Text("→ future:", size=(8, 1)),
+                sg.Text("?", key=f"-MOD_FEAT_FUT_{name}-", size=(12, 1)),
+            ]
+        )
+
+    features_frame = [
+        [sg.Text("Features into logistic regression")],
+        [
+            sg.Column(
+                feature_rows,
+                scrollable=True,
+                vertical_scroll_only=True,
+                size=(500, 260),
+            )
+        ],
+    ]
+
+    ode_frame = [
+        [sg.Text("ODE dynamics (self-tuning)")],
+        [
+            sg.Text("tau_temp_s:", size=(14, 1)),
+            sg.Text("?", key="-MOD_TAU_TEMP-", size=(12, 1)),
+        ],
+        [
+            sg.Text("tau_hum_s:", size=(14, 1)),
+            sg.Text("?", key="-MOD_TAU_HUM-", size=(12, 1)),
+        ],
+        [
+            sg.Text("cooldown_time_s:", size=(14, 1)),
+            sg.Text("?", key="-MOD_COOLDOWN-", size=(12, 1)),
+        ],
+        [
+            sg.Text("Target temp (°C):", size=(14, 1)),
+            sg.Text("?", key="-MOD_TARGET_TEMP-", size=(12, 1)),
+        ],
+        [
+            sg.Text("Target hum (%):", size=(14, 1)),
+            sg.Text("?", key="-MOD_TARGET_HUM-", size=(12, 1)),
+        ],
+    ]
+
+    model_frame = [
+        [sg.Text("Logistic regression status")],
+        [
+            sg.Text("p_sleep_model:", size=(14, 1)),
+            sg.Text("?", key="-MOD_P_SLEEP_MODEL-", size=(12, 1)),
+        ],
+        [
+            sg.Text("Model version:", size=(14, 1)),
+            sg.Text("?", key="-MOD_MODEL_VERSION-", size=(12, 1)),
+        ],
+        [
+            sg.Text("# training rows:", size=(14, 1)),
+            sg.Text("?", key="-MOD_TRAIN_ROWS-", size=(12, 1)),
+        ],
+        [
+            sg.Text("Last label:", size=(14, 1)),
+            sg.Text("?", key="-MOD_LAST_LABEL-", size=(16, 1)),
+        ],
+    ]
+
+    layout = [
+        [
+            sg.Frame(
+                "Features (now vs future)",
+                features_frame,
+                pad=(5, 5),
+                expand_x=True,
+                expand_y=True,
+            ),
+            sg.Column(
+                [
+                    [sg.Frame("ODE dynamics", ode_frame, pad=(5, 5))],
+                    [sg.Frame("Model / training", model_frame, pad=(5, 5))],
+                ]
+            ),
+        ],
+    ]
+    return layout
 
 # ---------------------------------------------------------------------------
-# Main entry
+# Main update logic
+# ---------------------------------------------------------------------------
+
+def format_val(v: Any, digits: int = 2) -> str:
+    if v is None:
+        return "–"
+    try:
+        f = float(v)
+    except Exception:
+        return str(v)
+    return f"{f:.{digits}f}"
+
+
+def update_overview_tab(
+    window: sg.Window,
+    nodes: Dict[str, Dict[str, Any]],
+    plan: Optional[Dict[str, Any]],
+) -> None:
+    # Current time
+    now_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    window["-OV_NOW-"].update(now_str)
+
+    # Plan summary
+    if plan is None:
+        window["-OV_GLOBAL_STATE-"].update("NO PLAN")
+        window["-OV_P_SLEEP-"].update("–")
+        window["-OV_P_SLEEP_MODEL-"].update("–")
+        window["-OV_CAM_LABEL-"].update("–")
+        window["-OV_CAM_CONF-"].update("–")
+    else:
+        window["-OV_GLOBAL_STATE-"].update(plan.get("global_state", "??"))
+        window["-OV_P_SLEEP-"].update(format_val(plan.get("p_sleep"), 3))
+        window["-OV_P_SLEEP_MODEL-"].update(
+            format_val(plan.get("p_sleep_model"), 3)
+        )
+        window["-OV_CAM_LABEL-"].update(str(plan.get("camera_label")))
+        window["-OV_CAM_CONF-"].update(format_val(plan.get("camera_conf"), 3))
+
+    # Helper to pull from nodes dict
+    def get_sensor(node: str, key: str) -> Optional[float]:
+        info = nodes.get(node)
+        if not info:
+            return None
+        return info.get("sensors", {}).get(key)
+
+    # ----- Window node: inside + outside -----
+    # Inside temp/hum: prefer *_in_ keys, fall back to original names
+    temp_win_in = get_sensor("window", "temp_win_in_c")
+    if temp_win_in is None:
+        temp_win_in = get_sensor("window", "temp_win_c")
+
+    hum_win_in = get_sensor("window", "hum_win_in_pct")
+    if hum_win_in is None:
+        hum_win_in = get_sensor("window", "hum_win_pct")
+
+    # Outside temp/hum from window node (if firmware sends them)
+    temp_win_out = get_sensor("window", "temp_win_out_c")
+    hum_win_out = get_sensor("window", "hum_win_out_pct")
+
+    window["-OV_WIN_TEMP_IN-"].update(format_val(temp_win_in))
+    window["-OV_WIN_HUM_IN-"].update(format_val(hum_win_in))
+    window["-OV_WIN_TEMP_OUT-"].update(format_val(temp_win_out))
+    window["-OV_WIN_HUM_OUT-"].update(format_val(hum_win_out))
+    window["-OV_WIN_LIGHT-"].update(
+        format_val(get_sensor("window", "light_win_lux"))
+    )
+
+    # ----- Bedside -----
+    window["-OV_BED_TEMP-"].update(
+        format_val(get_sensor("bedside", "temp_bed_c"))
+    )
+    window["-OV_BED_HUM-"].update(
+        format_val(get_sensor("bedside", "hum_bed_pct"))
+    )
+    # try both lux_bed and light_bed_lux
+    light_bed = get_sensor("bedside", "lux_bed")
+    if light_bed is None:
+        light_bed = get_sensor("bedside", "light_bed_lux")
+    window["-OV_BED_LIGHT-"].update(format_val(light_bed))
+
+    # ----- Door -----
+    window["-OV_DOOR_TEMP-"].update(
+        format_val(get_sensor("door", "temp_door_c"))
+    )
+    window["-OV_DOOR_HUM-"].update(
+        format_val(get_sensor("door", "hum_door_pct"))
+    )
+    window["-OV_DOOR_MIC-"].update(
+        format_val(get_sensor("door", "mic_v"), 3)
+    )
+    window["-OV_DOOR_LIGHT-"].update(
+        format_val(get_sensor("door", "light_door_v"), 3)
+    )
+
+    # ----- Weather -----
+    window["-OV_OUT_TEMP-"].update(
+        format_val(get_sensor("weather", "temp_outdoor_c"))
+    )
+    window["-OV_OUT_HUM-"].update(
+        format_val(get_sensor("weather", "hum_outdoor_pct"))
+    )
+
+    # ----- Camera raw sensors -----
+    cam_info = nodes.get("camera")
+    if cam_info:
+        raw = cam_info.get("sensors", {})
+        window["-OV_CAM_RAW-"].update(json.dumps(raw, indent=2))
+    else:
+        window["-OV_CAM_RAW-"].update("")
+
+
+def update_model_tab(
+    window: sg.Window,
+    plan: Optional[Dict[str, Any]],
+    model_meta: Dict[str, Any],
+    train_stats: Dict[str, Any],
+) -> None:
+    feats_now = {}
+    feats_future = {}
+    p_sleep_model = None
+    tau_temp = tau_hum = cooldown = None
+    target_temp = target_hum = None
+
+    if plan is not None:
+        feats_now = plan.get("features_now", {}) or {}
+        feats_future = plan.get("features_future", {}) or {}
+        p_sleep_model = plan.get("p_sleep_model")
+        tau_temp = plan.get("tau_temp_s")
+        tau_hum = plan.get("tau_hum_s")
+        cooldown = plan.get("cooldown_time_s")
+        target_temp = plan.get("target_temp_c")
+        target_hum = plan.get("target_hum_pct")
+
+    # Features
+    for name in FEATURE_NAMES:
+        v_now = feats_now.get(name)
+        v_fut = feats_future.get(name)
+        window[f"-MOD_FEAT_NOW_{name}-"].update(format_val(v_now))
+        window[f"-MOD_FEAT_FUT_{name}-"].update(format_val(v_fut))
+
+    # ODE
+    window["-MOD_TAU_TEMP-"].update(format_val(tau_temp))
+    window["-MOD_TAU_HUM-"].update(format_val(tau_hum))
+    window["-MOD_COOLDOWN-"].update(format_val(cooldown, 1))
+    window["-MOD_TARGET_TEMP-"].update(format_val(target_temp, 1))
+    window["-MOD_TARGET_HUM-"].update(format_val(target_hum, 1))
+
+    # Model / training
+    window["-MOD_P_SLEEP_MODEL-"].update(format_val(p_sleep_model, 3))
+    window["-MOD_MODEL_VERSION-"].update(str(model_meta.get("version", 0)))
+    window["-MOD_TRAIN_ROWS-"].update(str(train_stats.get("n_rows", 0)))
+    window["-MOD_LAST_LABEL-"].update(str(train_stats.get("last_label")))
+
+# ---------------------------------------------------------------------------
+# Main
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    # Start network thread
-    t = threading.Thread(target=network_loop, daemon=True)
-    t.start()
+    sg.theme("DarkBlue3")
 
-    # Start GUI
-    root = tk.Tk()
-    app = DashboardGUI(root)
-    root.mainloop()
+    layout = [
+        [
+            sg.TabGroup(
+                [
+                    [
+                        sg.Tab(
+                            "Overview",
+                            make_overview_tab_layout(),
+                            key="-TAB_OV-",
+                        ),
+                        sg.Tab(
+                            "Model Internals",
+                            make_model_tab_layout(),
+                            key="-TAB_MOD-",
+                        ),
+                    ]
+                ],
+                expand_x=True,
+                expand_y=True,
+            )
+        ],
+        [sg.Button("Exit")],
+    ]
+
+    window = sg.Window(
+        "Sleep Env Dashboard",
+        layout,
+        resizable=True,
+        finalize=True,
+    )
+
+    last_refresh = 0.0
+
+    while True:
+        event, values = window.read(timeout=200)
+        if event in (sg.WINDOW_CLOSED, "Exit"):
+            break
+
+        now = time.time()
+        if now - last_refresh >= REFRESH_INTERVAL_SEC:
+            last_refresh = now
+
+            nodes = read_latest_sensor_rows()
+            plan = read_latest_plan()
+            model_meta = read_model_meta()
+            train_stats = read_training_stats()
+
+            update_overview_tab(window, nodes, plan)
+            update_model_tab(window, plan, model_meta, train_stats)
+
+    window.close()
 
 
 if __name__ == "__main__":

@@ -12,9 +12,12 @@ Networked simulation driver for the PC brain.
   (Open-Meteo) using approximate location from IP, and injects them as a
   synthetic "weather" node for the sleep model to use.
 - Builds a separate training_data.csv whenever camera labels arrive, pairing
-  them with recent sensor features from the ESP32 nodes.
+  them with recent sensor features from the ESP32 nodes (window/bedside/door)
+  plus the outdoor weather node.
 - Tracks a simple model version and logs "retrain" events when enough training
   data accumulates.
+- Logs every sleep plan to logs/plan_log.jsonl so dashboards can display
+  "what the brain is thinking".
 """
 
 from __future__ import annotations
@@ -29,7 +32,7 @@ import requests  # for HTTP calls to IP + weather APIs
 
 import network_server
 from kasa_control_stub import set_device_state
-from sleep_model_stub import compute_sleep_plan
+from sleep_model_stub import compute_sleep_plan, train_model_from_csv
 
 # How much history (in seconds) to keep in memory for the model
 HISTORY_SECONDS = 30 * 60  # 30 minutes
@@ -56,7 +59,10 @@ TRAIN_LOG_FILE = LOG_PATH / "training_data.csv"
 MODEL_META_PATH = LOG_PATH / "model_meta.json"
 MODEL_EVENT_LOG = LOG_PATH / "model_events.csv"
 
-# Model version tracking (purely metadata here; plug your real training in later)
+# Plan log for dashboard (JSON lines)
+PLAN_LOG_FILE = LOG_PATH / "plan_log.jsonl"
+
+# Model version tracking
 MODEL_VERSION: int = 0
 LAST_TRAINED_SAMPLES: int = 0
 MIN_SAMPLES_FOR_RETRAIN: int = 50  # tweak for your project size
@@ -166,13 +172,12 @@ def _count_training_samples() -> int:
 
 def _maybe_retrain_model_from_training_csv() -> None:
     """
-    Simple "fake training" hook:
+    Real training hook:
 
     - Count rows in training_data.csv
-    - If count >= MIN_SAMPLES_FOR_RETRAIN and > LAST_TRAINED_SAMPLES,
-      bump MODEL_VERSION and log a retrain event.
-
-    Plug your actual ML training code in place of the comment below.
+    - If count >= MIN_SAMPLES_FOR_RETRAIN and > LAST_TRAINED_SAMPLES:
+        * Train logistic regression from CSV
+        * If training succeeds, bump MODEL_VERSION and update metadata
     """
     global MODEL_VERSION, LAST_TRAINED_SAMPLES
 
@@ -187,12 +192,12 @@ def _maybe_retrain_model_from_training_csv() -> None:
         f"n_samples={n_samples}, prev_trained={LAST_TRAINED_SAMPLES}"
     )
 
-    # ------------------------------------------------------------
-    # TODO: insert your real training call here, e.g.:
-    #   model = train_model_from_csv(TRAIN_LOG_FILE)
-    #   save_model(model)
-    # For now we just bump metadata.
-    # ------------------------------------------------------------
+    model_path = LOG_PATH / "sleep_model.json"
+    ok = train_model_from_csv(TRAIN_LOG_FILE, model_out_path=model_path)
+
+    if not ok:
+        print("[MODEL] Training failed; keeping old model/version.")
+        return
 
     LAST_TRAINED_SAMPLES = n_samples
     MODEL_VERSION += 1
@@ -249,22 +254,18 @@ def main() -> None:
 
             # Periodically compute and broadcast a plan
             if now - last_plan_time >= PLAN_INTERVAL_SEC:
-                if recent_features:
-                    plan = compute_sleep_plan(recent_features)
-                else:
-                    # No data yet; ask the stub for a default plan
-                    plan = compute_sleep_plan([])
-
-                # Attach model_version for visibility on ESP32 / logs
-                if isinstance(plan, dict):
-                    plan["model_version"] = MODEL_VERSION
-                elif isinstance(plan, list):
-                    for p in plan:
-                        if isinstance(p, dict):
-                            p["model_version"] = MODEL_VERSION
+                plan = compute_sleep_plan(recent_features, model_version=MODEL_VERSION)
 
                 print("[BRAIN] Broadcasting plan:")
                 print(json.dumps(plan, indent=2))
+
+                # Log plan to JSONL for dashboard
+                try:
+                    PLAN_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+                    with PLAN_LOG_FILE.open("a") as pf:
+                        pf.write(json.dumps(plan) + "\n")
+                except Exception as e:
+                    print(f"[BRAIN] Failed to log plan: {e}")
 
                 network_server.broadcast(plan)
                 last_plan_time = now
@@ -382,7 +383,8 @@ def _handle_feature(message: Dict[str, Any], recent_features: List[Dict[str, Any
     We:
     - Normalize/attach a real timestamp.
     - Append to the rolling 30-minute history.
-    - Log to CSV for offline analysis.
+    - Log to CSV for offline analysis (sensor_log.csv) with a stable header
+      that includes ALL sensor keys we've ever seen (including weather).
     - If node == 'camera', also build a training row and maybe retrain the model.
     """
     # Normalize timestamp: if 'ts' looks like a real Unix timestamp (seconds), use it;
@@ -414,7 +416,13 @@ def _handle_feature(message: Dict[str, Any], recent_features: List[Dict[str, Any
 
 
 def _log_feature_to_csv(message: Dict[str, Any]) -> None:
-    """Append a flattened version of the feature message to sensor_log.csv."""
+    """
+    Append a flattened version of the feature message to sensor_log.csv.
+
+    This implementation guarantees that ALL sensor keys we've ever seen
+    (including temp_outdoor_c, hum_outdoor_pct, etc.) appear as columns,
+    by rewriting the CSV header if new keys appear later.
+    """
     node = message.get("node", "unknown")
     ts = message.get("ts", time.time())
     sensors = message.get("sensors", {})
@@ -427,12 +435,42 @@ def _log_feature_to_csv(message: Dict[str, Any]) -> None:
     for k, v in sensors.items():
         row[f"s_{k}"] = v
 
-    file_exists = LOG_FILE.exists()
-    with LOG_FILE.open("a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=row.keys())
-        if not file_exists:
+    if not LOG_FILE.exists():
+        # First time: write file with this row's keys as header
+        fieldnames = sorted(row.keys())
+        with LOG_FILE.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
-        writer.writerow(row)
+            writer.writerow(row)
+        return
+
+    # If file already exists, we may need to add new columns
+    # 1) Read existing header and all rows
+    with LOG_FILE.open("r", newline="") as f:
+        reader = csv.DictReader(f)
+        existing_fieldnames = reader.fieldnames or []
+        existing_rows = list(reader)
+
+    # 2) Compute union of existing fieldnames and new row keys
+    new_fieldnames_set = set(existing_fieldnames) | set(row.keys())
+    # Preserve order: ts, node first; then the rest sorted
+    base_order = ["ts", "node"]
+    rest = sorted(fn for fn in new_fieldnames_set if fn not in base_order)
+    fieldnames = base_order + rest
+
+    # 3) Rewrite entire file with new header if needed
+    with LOG_FILE.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+
+        # Write old rows, filling missing keys with empty string
+        for old in existing_rows:
+            out = {fn: old.get(fn, "") for fn in fieldnames}
+            writer.writerow(out)
+
+        # Write new row with any missing columns filled
+        out_new = {fn: row.get(fn, "") for fn in fieldnames}
+        writer.writerow(out_new)
 
 
 # --------------------------------------------------------------------------
@@ -471,12 +509,15 @@ def _build_training_example_from_context(
     sensors = camera_msg.get("sensors", {})
     ts_label = float(camera_msg.get("ts", time.time()))
 
-    # Heuristic: try a few common key names for label + confidence
+    # ---------- FLEXIBLE LABEL / CONF EXTRACTION ----------
+    # 1) Try common keys explicitly
     label = (
         sensors.get("state")
         or sensors.get("label")
         or sensors.get("camera_state")
         or sensors.get("class")
+        or sensors.get("pose")
+        or sensors.get("sleep_state")
     )
     conf = (
         sensors.get("conf")
@@ -486,8 +527,18 @@ def _build_training_example_from_context(
         or sensors.get("score")
     )
 
+    # 2) If still no label, scan all keys for something that LOOKS like a state/label
     if label is None:
-        print("[TRAIN] Camera message missing label field; skipping training row.")
+        for k, v in sensors.items():
+            if not isinstance(v, str):
+                continue
+            kl = k.lower()
+            if any(sub in kl for sub in ["state", "label", "pose", "sleep"]):
+                label = v
+                break
+
+    if label is None:
+        print("[TRAIN] Camera message missing label-like field in sensors; got:", sensors)
         return None
 
     try:
@@ -495,8 +546,14 @@ def _build_training_example_from_context(
     except Exception:
         label_conf = float("nan")
 
+
+    try:
+        label_conf = float(conf) if conf is not None else float("nan")
+    except Exception:
+        label_conf = float("nan")
+
     # Look back up to 60 seconds for context
-    MAX_AGE_SEC = 60.0
+    MAX_AGE_SEC = 60.0*30
 
     win_msg = _latest_feature_for_node(recent_features, "window", MAX_AGE_SEC, ts_label)
     bed_msg = _latest_feature_for_node(recent_features, "bedside", MAX_AGE_SEC, ts_label)
@@ -572,7 +629,7 @@ def _handle_camera_label(
     _append_training_row(row)
     print("[TRAIN] Appended training example to training_data.csv")
 
-    # Check if it's time to "retrain"
+    # Check if it's time to retrain
     _maybe_retrain_model_from_training_csv()
 
 
