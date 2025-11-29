@@ -1,14 +1,28 @@
 #include <WiFi.h>
 #include "DHT.h"
-#include <Preferences.h>
+
+// ====== BLE includes ======
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEScan.h>
+#include <BLEAdvertisedDevice.h>
+// ==========================
 
 // ====== CONFIGURE THESE ======
 const char* WIFI_SSID     = "Mehrali68";
 const char* WIFI_PASSWORD = "4165659393";
 
-// Raspberry Pi (or dev machine) IP + port
-const char* SERVER_IP     = "10.0.0.43";
+const char* SERVER_IP     = "10.0.0.31";
 const uint16_t SERVER_PORT = 5000;
+
+// Logical node ID (for JSON) and BLE device name (for advertising)
+const char* NODE_ID       = "window";
+const char* NODE_BLE_NAME = "window-node";
+
+// Names of the OTHER two ESP32 nodes, as they advertise over BLE.
+// Match these to NODE_BLE_NAME of your bedside + door nodes.
+const char* PEER1_NAME    = "door-node";
+const char* PEER2_NAME    = "bed-node";
 // =============================
 
 // DHT22 setup
@@ -20,15 +34,10 @@ DHT dhtInside(DHT_INSIDE_PIN, DHTTYPE);
 DHT dhtOutside(DHT_OUTSIDE_PIN, DHTTYPE);
 
 WiFiClient client;
-Preferences prefs;
 
 // how often to send a feature message (ms)
 const unsigned long FEATURE_INTERVAL_MS = 10UL * 1000UL;
-const float         DT_SEC              = FEATURE_INTERVAL_MS / 1000.0f;
-
 unsigned long lastFeatureMillis  = 0;
-unsigned long lastPersistMillis  = 0;
-const unsigned long PERSIST_INTERVAL_MS = 60UL * 1000UL; // write to flash at most once per minute
 
 String rxBuffer;
 
@@ -82,115 +91,20 @@ struct Kalman1D {
 Kalman1D kfTempInside;
 Kalman1D kfHumInside;
 
-// ---- Simple first-order cooling model ----
+// ---- BLE globals ----
+BLEScan*        pBLEScan      = nullptr;
+BLEAdvertising* pAdvertising  = nullptr;
+const int BLE_SCAN_TIME_SEC   = 2;     // scan duration when we do scan
+const int RSSI_INVALID        = -999;  // sentinel for "not seen"
 
-enum WindowMode {
-  MODE_CLOSED = 0,
-  MODE_OPEN   = 1,
-  MODE_OPEN_FAN = 2
-};
+// BLE scan cadence: only triangulate every 5 minutes
+const unsigned long BLE_SCAN_INTERVAL_MS = 5UL * 60UL * 1000UL;
+unsigned long lastBleScanMillis = 0;
 
-struct CoolingModel {
-  float alpha_closed;
-  float alpha_open;
-  float alpha_open_fan;
-};
-
-CoolingModel model;
-
-WindowMode currentMode = MODE_CLOSED;
-WindowMode prevMode    = MODE_CLOSED;
-
-float T_in_prev  = NAN;
-float T_out_prev = NAN;
-
-const float ETA_ALPHA   = 0.05f;  // learning rate
-const float EPS_DENOM   = 0.2f;   // avoid tiny denominator
-const float ALPHA_MIN   = 0.0f;
-const float ALPHA_MAX   = 0.5f;   // safety cap
-
-void loadModelFromFlash() {
-  prefs.begin("window_model", false);
-  model.alpha_closed   = prefs.getFloat("a_closed",   0.001f);
-  model.alpha_open     = prefs.getFloat("a_open",     0.01f);
-  model.alpha_open_fan = prefs.getFloat("a_open_fan", 0.02f);
-
-  logLine("[WIN] Loaded model alphas:");
-  logLine("  alpha_closed   = " + String(model.alpha_closed, 6));
-  logLine("  alpha_open     = " + String(model.alpha_open, 6));
-  logLine("  alpha_open_fan = " + String(model.alpha_open_fan, 6));
-}
-
-void persistModelToFlash() {
-  prefs.putFloat("a_closed",   model.alpha_closed);
-  prefs.putFloat("a_open",     model.alpha_open);
-  prefs.putFloat("a_open_fan", model.alpha_open_fan);
-  logLine("[WIN] Persisted model alphas to flash");
-}
-
-void updateModelFromSample(float T_in, float T_out) {
-  if (isnan(T_in_prev) || isnan(T_out_prev)) {
-    T_in_prev  = T_in;
-    T_out_prev = T_out;
-    prevMode   = currentMode;
-    return;
-  }
-
-  if (currentMode == prevMode) {
-    float denom = (T_out_prev - T_in_prev);
-    if (fabs(denom) > EPS_DENOM) {
-      float num = (T_in - T_in_prev);
-      float alpha_sample = num / denom;
-
-      // Clamp sample to reasonable range
-      if (alpha_sample > ALPHA_MIN && alpha_sample < ALPHA_MAX) {
-        float* alpha_target = nullptr;
-        if (currentMode == MODE_CLOSED)    alpha_target = &model.alpha_closed;
-        if (currentMode == MODE_OPEN)      alpha_target = &model.alpha_open;
-        if (currentMode == MODE_OPEN_FAN)  alpha_target = &model.alpha_open_fan;
-
-        if (alpha_target) {
-          *alpha_target = (1.0f - ETA_ALPHA) * (*alpha_target)
-                        + ETA_ALPHA * alpha_sample;
-        }
-      }
-    }
-  }
-
-  // Update previous state for next step
-  T_in_prev  = T_in;
-  T_out_prev = T_out;
-  prevMode   = currentMode;
-}
-
-// Estimate time (in seconds) to reach a target temp given alpha and dt
-float estimateTimeToTarget(float T_in0,
-                           float T_out,
-                           float T_target,
-                           float alpha,
-                           float dt_sec) {
-  if (alpha <= 0.0f || alpha >= 0.5f) {
-    return INFINITY;
-  }
-
-  float num   = T_target - T_out;
-  float denom = T_in0    - T_out;
-  if (fabs(denom) < 0.1f) {
-    // Already near outside temp or no usable gradient
-    return 0.0f;
-  }
-
-  float ratio = num / denom;
-  // If ratio not between 0 and 1, target is outside the asymptotic range
-  if (ratio <= 0.0f || ratio >= 1.0f) {
-    return INFINITY;
-  }
-
-  float k = logf(ratio) / logf(1.0f - alpha);
-  if (k < 0.0f) k = 0.0f;
-
-  return k * dt_sec;
-}
+// cached last known RSSI values from last triangulation
+int lastPeer1Rssi = RSSI_INVALID;
+int lastPeer2Rssi = RSSI_INVALID;
+// --------------------------------
 
 // ---- WiFi + TCP connect helpers ----
 
@@ -220,7 +134,9 @@ bool connectToServer() {
 }
 
 void sendHello() {
-  String hello = "{\"type\":\"hello\",\"node\":\"window\"}\n";
+  String hello = "{\"type\":\"hello\",\"node\":\"";
+  hello += NODE_ID;
+  hello += "\"}\n";
   client.print(hello);
   logLine("[WIN] Sent hello: " + hello);
 }
@@ -245,7 +161,75 @@ float safeReadHum(DHT& dht, const char* label) {
   return h;
 }
 
-// ---- Feature generation from DHT22s + Kalman + model learning ----
+// ---- BLE init ----
+void initBLE() {
+  logLine("[WIN] Initializing BLE...");
+  BLEDevice::init(NODE_BLE_NAME);
+
+  // Advertise this node so other ESP32s can see it
+  pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->start();
+  logLine("[WIN] BLE advertising started as: " + String(NODE_BLE_NAME));
+
+  // Prepare scanner to look for other ESP32 nodes
+  pBLEScan = BLEDevice::getScan();
+  pBLEScan->setActiveScan(true);  // active scan gives RSSI + name
+  pBLEScan->setInterval(100);     // ms
+  pBLEScan->setWindow(80);        // ms (must be <= interval)
+  logLine("[WIN] BLE scanner ready");
+}
+
+// ---- BLE scan helper to find other ESP32 nodes ----
+void scanForPeers(int& peer1Rssi, int& peer2Rssi) {
+  peer1Rssi = RSSI_INVALID;
+  peer2Rssi = RSSI_INVALID;
+
+  if (!pBLEScan) return;
+
+  // In your BLE lib, start() returns a pointer to BLEScanResults
+  BLEScanResults* results = pBLEScan->start(BLE_SCAN_TIME_SEC, false);
+  if (!results) {
+    pBLEScan->clearResults();
+    logLine("[WIN] BLE scan returned null results");
+    return;
+  }
+
+  int count = results->getCount();
+
+  for (int i = 0; i < count; ++i) {
+    BLEAdvertisedDevice dev = results->getDevice(i);
+
+    // Normalize name into Arduino String
+    String devName = String(dev.getName().c_str());
+    int rssi = dev.getRSSI();
+
+    if (devName == PEER1_NAME) {
+      if (peer1Rssi == RSSI_INVALID || rssi > peer1Rssi) {
+        peer1Rssi = rssi;
+      }
+    } else if (devName == PEER2_NAME) {
+      if (peer2Rssi == RSSI_INVALID || rssi > peer2Rssi) {
+        peer2Rssi = rssi;
+      }
+    }
+  }
+
+  pBLEScan->clearResults();
+
+  if (peer1Rssi == RSSI_INVALID) {
+    logLine("[WIN] BLE peer1 (" + String(PEER1_NAME) + ") not seen this interval");
+  } else {
+    logLine("[WIN] BLE peer1 (" + String(PEER1_NAME) + ") RSSI = " + String(peer1Rssi));
+  }
+
+  if (peer2Rssi == RSSI_INVALID) {
+    logLine("[WIN] BLE peer2 (" + String(PEER2_NAME) + ") not seen this interval");
+  } else {
+    logLine("[WIN] BLE peer2 (" + String(PEER2_NAME) + ") RSSI = " + String(peer2Rssi));
+  }
+}
+
+// ---- Feature generation from DHT22s + Kalman + BLE ----
 
 void sendFeature() {
   // Raw readings from inside DHT
@@ -260,31 +244,26 @@ void sendFeature() {
   float temp_win_filt = kfTempInside.update(temp_win_raw);
   float hum_win_filt  = kfHumInside.update(hum_win_raw);
 
-  // ---- Update dynamic model from this sample ----
-  if (!isnan(temp_win_filt) && !isnan(temp_out_c)) {
-    updateModelFromSample(temp_win_filt, temp_out_c);
-  }
-
-  // For now, just demonstrate the time-to-target estimate for a fixed target
-  float T_target_demo = 22.0f;  // demo target
-  float t_closed   = estimateTimeToTarget(temp_win_filt, temp_out_c,
-                                          T_target_demo, model.alpha_closed, DT_SEC);
-  float t_open     = estimateTimeToTarget(temp_win_filt, temp_out_c,
-                                          T_target_demo, model.alpha_open, DT_SEC);
-  float t_open_fan = estimateTimeToTarget(temp_win_filt, temp_out_c,
-                                          T_target_demo, model.alpha_open_fan, DT_SEC);
-
   logLine("[WIN] T_in=" + String(temp_win_filt, 2) +
-          " T_out=" + String(temp_out_c, 2) +
-          " -> t_closed=" + String(t_closed, 1) +
-          "s, t_open=" + String(t_open, 1) +
-          "s, t_open_fan=" + String(t_open_fan, 1) + "s");
+          "C, T_out=" + String(temp_out_c, 2) +
+          "C, RH_in=" + String(hum_win_filt, 2) +
+          "%, RH_out=" + String(hum_out_pct, 2) + "%");
+
+  // ---- BLE scan for triangulation every 5 minutes ----
+  unsigned long now = millis();
+  if (now - lastBleScanMillis >= BLE_SCAN_INTERVAL_MS) {
+    logLine("[WIN] Running BLE scan for peers...");
+    scanForPeers(lastPeer1Rssi, lastPeer2Rssi);
+    lastBleScanMillis = now;
+  }
 
   // ---- Build JSON message ----
   unsigned long ts = (unsigned long)(millis() / 1000UL); // pseudo-timestamp
 
   String json = "{";
-  json += "\"node\":\"window\",";
+  json += "\"node\":\"";
+  json += NODE_ID;
+  json += "\",";
   json += "\"ts\":" + String(ts) + ",";
   json += "\"sensors\":{";
 
@@ -297,18 +276,22 @@ void sendFeature() {
   json += isnan(hum_win_filt) ? "null" : String(hum_win_filt, 2);
   json += ",";
 
-  // Outside values (raw for now)
+  // Outside values (raw)
   json += "\"temp_out_c\":";
   json += isnan(temp_out_c) ? "null" : String(temp_out_c, 2);
   json += ",";
 
   json += "\"hum_out_pct\":";
   json += isnan(hum_out_pct) ? "null" : String(hum_out_pct, 2);
+  json += ",";
 
-  // Optionally, we could also publish learned alpha params for logging/debug
-  // json += ",\"alpha_closed\":"   + String(model.alpha_closed, 6);
-  // json += ",\"alpha_open\":"     + String(model.alpha_open, 6);
-  // json += ",\"alpha_open_fan\":" + String(model.alpha_open_fan, 6);
+  // BLE RSSI fields (cached, updated every 5 minutes)
+  json += "\"ble_peer1_rssi\":";
+  json += (lastPeer1Rssi == RSSI_INVALID ? "null" : String(lastPeer1Rssi));
+  json += ",";
+
+  json += "\"ble_peer2_rssi\":";
+  json += (lastPeer2Rssi == RSSI_INVALID ? "null" : String(lastPeer2Rssi));
 
   json += "}}";
   json += "\n";
@@ -318,7 +301,6 @@ void sendFeature() {
 }
 
 // ---- Receive plan (newline-delimited JSON) ----
-// (For now, we only parse 'state' as before. Later you can parse temp target & t_sleep_pred.)
 void handleIncomingData() {
   while (client.available() > 0) {
     char c = (char)client.read();
@@ -366,9 +348,10 @@ void setup() {
   kfTempInside.init(0.01f, 0.5f);  // temp: slow change, moderate noise
   kfHumInside.init( 0.05f, 2.0f);  // humidity: a bit noisier
 
-  // Load dynamic model from flash (self-learned alphas)
-  loadModelFromFlash();
+  // Init BLE (advertise + scanner)
+  initBLE();
 
+  // WiFi + TCP
   connectWifi();
 
   // Try to connect to server; keep retrying
@@ -378,7 +361,7 @@ void setup() {
 
   sendHello();
   lastFeatureMillis = millis();
-  lastPersistMillis = millis();
+  lastBleScanMillis = millis();  // so first BLE scan happens after 5 min
 }
 
 void loop() {
@@ -401,12 +384,6 @@ void loop() {
   if (now - lastFeatureMillis >= FEATURE_INTERVAL_MS) {
     sendFeature();
     lastFeatureMillis = now;
-  }
-
-  // Periodically persist model to flash
-  if (now - lastPersistMillis >= PERSIST_INTERVAL_MS) {
-    persistModelToFlash();
-    lastPersistMillis = now;
   }
 
   // Handle any incoming sleep plan JSON

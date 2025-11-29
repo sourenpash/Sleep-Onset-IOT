@@ -22,8 +22,9 @@ Unified sleep + environment model:
     Offline training from a CSV log (e.g. fake_night.csv or real night logs).
 
 - Optional ONLINE learning:
-    - Logistic: if ENABLE_ONLINE_LOGISTIC is True and a special label
-      message is present in recent_features, we do an SGD step.
+    - Logistic: if ENABLE_ONLINE_LOGISTIC is True we do an SGD step on each
+      call using either an explicit label message or a label derived from
+      the camera node.
     - Env ODE: if ENABLE_ENV_ONLINE_TUNING is True, we update k_temp/k_hum
       from successive temp/humidity samples and persist periodically.
 """
@@ -50,13 +51,13 @@ MODEL_PATH = Path(__file__).with_name("sleep_model_state.json")
 ENV_MODEL_PATH = Path(__file__).with_name("env_model_state.json")
 
 # Online learning toggles
-ENABLE_ONLINE_LOGISTIC = False        # set to True to enable online SGD updates
-ENABLE_ENV_ONLINE_TUNING = False      # set to True to tune k_temp/k_hum online
+ENABLE_ONLINE_LOGISTIC = True        # enable online SGD updates
+ENABLE_ENV_ONLINE_TUNING = True      # enable k_temp/k_hum online tuning
 
 # For logistic online learning (small learning rate)
 ONLINE_LR = 1e-3
 
-# Node name + key for online labels
+# Node name + key for explicit online labels (optional)
 # If you push a message like:
 #   {"node": "__sleep_label", "sensors": {"y_sleep_within_horizon": 1}}
 # into recent_features, we'll use it as an online training target.
@@ -453,6 +454,8 @@ def _extract_features(
         s = bedside.get("sensors", {})
         temp_bed = _safe_float(s, "temp_bed_c", temp_bed)
         hum_bed = _safe_float(s, "hum_bed_pct", hum_bed)
+        # Real-time nodes may send "lux_bed"; training scripts may use "light_bed_lux".
+        light_bed = _safe_float(s, "lux_bed", light_bed)
         light_bed = _safe_float(s, "light_bed_lux", light_bed)
         noise_level = _safe_float(s, "noise_level", noise_level)
         motion_index = _safe_float(s, "motion_index", motion_index)
@@ -580,6 +583,61 @@ def _classify_state_from_sensors(
 
 
 # ---------------------------------------------------------------------
+# Derive weak labels from camera (for online learning)
+# ---------------------------------------------------------------------
+
+def _derive_label_from_camera(recent_features: List[Dict[str, Any]]) -> Optional[float]:
+    """
+    Use the latest camera state as a weak label for online learning.
+
+    Returns:
+        1.0 if clearly asleep,
+        0.0 if clearly awake,
+        None otherwise (ambiguous).
+    """
+    cam = _find_latest_node(recent_features, "camera")
+    if cam is None:
+        return None
+
+    s = cam.get("sensors", {})
+
+    # Option A: numeric state code (e.g. 0=IN_ROOM,1=IN_BED,2=ASLEEP)
+    if "cam_state_code" in s:
+        try:
+            code = int(s["cam_state_code"])
+        except Exception:
+            return None
+        if code == 2:
+            return 1.0
+        elif code == 0:
+            return 0.0
+        else:
+            return None
+
+    # Option B: string cam_state
+    if "cam_state" in s:
+        st = str(s["cam_state"]).upper()
+        if st in ("ASLEEP", "SLEEP_LIKE"):
+            return 1.0
+        elif st in ("IN_ROOM", "AWAKE"):
+            return 0.0
+        else:
+            return None
+
+    # Option C: probabilistic fields
+    sleep_like = _safe_float(s, "sleep_like_prob", 0.5)
+    in_bed_prob = _safe_float(s, "in_bed_prob", 0.5)
+
+    # Conservative thresholds to avoid noisy labels
+    if sleep_like > 0.9:
+        return 1.0
+    if (sleep_like < 0.1) and (in_bed_prob < 0.3):
+        return 0.0
+
+    return None
+
+
+# ---------------------------------------------------------------------
 # Public: compute_sleep_plan (used by brain_server)
 # ---------------------------------------------------------------------
 
@@ -590,7 +648,7 @@ def compute_sleep_plan(recent_features: List[Dict[str, Any]]) -> Dict[str, Any]:
     Steps:
       1) Extract features from recent_features (including camera if present).
       2) Run logistic hazard model to get p_sleep_within_base_horizon.
-      3) Optional: online SGD update if a label message is present.
+      3) Optional: online SGD update from explicit label or camera-derived label.
       4) Use heuristic to classify current state AWAKE/WINDING_DOWN/ASLEEP.
       5) Use EnvModel to estimate time to hit temp/humidity targets at the bed,
          with optional online tuning of k_temp/k_hum.
@@ -607,9 +665,15 @@ def compute_sleep_plan(recent_features: List[Dict[str, Any]]) -> Dict[str, Any]:
     z = float(np.dot(w, feats) + b)
     p_sleep_soon = _sigmoid(z)  # P(sleep within BASE_HORIZON_MIN)
 
-    # 3) Optional online update if label present
+    # 3) Optional online update (explicit label OR camera-derived label)
     if ENABLE_ONLINE_LOGISTIC:
+        # First look for explicit label messages if you ever send them
         y_label = _find_online_label(recent_features)
+
+        # If none, fall back to auto-derived label from camera
+        if y_label is None:
+            y_label = _derive_label_from_camera(recent_features)
+
         if y_label is not None:
             w, b = _online_update_logistic(w, b, feats, y_label, lr=ONLINE_LR)
             _save_logistic_model(w, b)  # persist after online step
@@ -642,16 +706,22 @@ def compute_sleep_plan(recent_features: List[Dict[str, Any]]) -> Dict[str, Any]:
         H0=hum_bed, H_out=hum_out, H_target=hum_target
     )
 
+    # Sanitize env times: if model says "infinite", fall back to base horizon
+    if not math.isfinite(tau_temp_min):
+        tau_temp_min = BASE_HORIZON_MIN
+    if not math.isfinite(tau_hum_min):
+        tau_hum_min = BASE_HORIZON_MIN
+
     # Optional env online tuning
     if ENABLE_ENV_ONLINE_TUNING:
-        # Use the latest 'ts' from bedside (or fallback to now)
-        # We'll just grab default TS from the latest bedside message if available.
         bedside = _find_latest_node(recent_features, "bedside")
         ts = float(bedside["ts"]) if bedside and "ts" in bedside else now
         _update_env_model_online(env_model, dbg, ts)
 
     # Effective horizon: must be long enough for env to catch up
     effective_horizon_min = max(BASE_HORIZON_MIN, tau_temp_min, tau_hum_min)
+    if not math.isfinite(effective_horizon_min) or effective_horizon_min <= 0.0:
+        effective_horizon_min = BASE_HORIZON_MIN
 
     # 6) Predicted sleep time + confidence
     if state == "ASLEEP":
@@ -665,6 +735,10 @@ def compute_sleep_plan(recent_features: List[Dict[str, Any]]) -> Dict[str, Any]:
             dt_min = 1.0 * effective_horizon_min
         else:
             dt_min = 1.5 * effective_horizon_min
+
+        # Final guard: avoid infinities/NaNs causing OverflowError
+        if not math.isfinite(dt_min) or dt_min < 0.0:
+            dt_min = BASE_HORIZON_MIN
 
         t_sleep_pred = int(now + dt_min * 60.0)
         confidence = float(p_sleep_soon)

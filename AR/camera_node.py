@@ -8,7 +8,7 @@ import mediapipe as mp
 from mediapipe.framework.formats import landmark_pb2
 
 # ==== CONFIGURE THESE ====
-SERVER_IP = "10.0.0.43"   # <-- your PC IP (same as ESP32 uses)
+SERVER_IP = "10.0.0.31"   # <-- your PC IP (same as ESP32 uses)
 SERVER_PORT = 5000
 
 CAMERA_INDEX = 0           # 0 = default webcam
