@@ -1,24 +1,4 @@
-"""
-Networked simulation driver for the PC brain.
 
-- Starts a TCP server (via network_server).
-- Ingests feature messages from ESP32 nodes (bedside, window, door, etc.).
-- Maintains a rolling ~30-minute history of sensor data.
-- Logs all incoming sensor data to CSV for offline analysis.
-- Periodically calls compute_sleep_plan(recent_features) to generate a plan.
-- Broadcasts the plan back to all connected nodes.
-- Handles optional "actuation intent" messages from nodes (for Kasa stubs).
-- Periodically fetches OUTDOOR temperature & humidity from a free weather API
-  (Open-Meteo) using approximate location from IP, and injects them as a
-  synthetic "weather" node for the sleep model to use.
-- Builds a separate training_data.csv whenever camera labels arrive, pairing
-  them with recent sensor features from the ESP32 nodes (window/bedside/door)
-  plus the outdoor weather node.
-- Tracks a simple model version and logs "retrain" events when enough training
-  data accumulates.
-- Logs every sleep plan to logs/plan_log.jsonl so dashboards can display
-  "what the brain is thinking".
-"""
 
 from __future__ import annotations
 
@@ -28,28 +8,21 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import requests  # for HTTP calls to IP + weather APIs
+import requests  
 
 import network_server
 from kasa_control_stub import set_device_state
 from sleep_model_stub import compute_sleep_plan, train_model_from_csv
 
-# How much history (in seconds) to keep in memory for the model
-HISTORY_SECONDS = 30 * 60  # 30 minutes
+HISTORY_SECONDS = 30 * 60  
 
-# How often to compute and broadcast a new plan
 PLAN_INTERVAL_SEC = 10
 
-# ---- Outdoor weather config ----
-# How often to refresh outdoor weather (seconds)
-WEATHER_UPDATE_INTERVAL_SEC = 10 * 60  # every 10 minutes
+WEATHER_UPDATE_INTERVAL_SEC = 10 * 60  
 
-# When IP geolocation fails, fall back to a fixed location
-# (Downtown-ish Toronto, Ontario)
 FALLBACK_LAT = 43.65
 FALLBACK_LON = -79.38
 
-# Logging config
 LOG_PATH = Path("logs")
 LOG_PATH.mkdir(exist_ok=True)
 LOG_FILE = LOG_PATH / "sensor_log.csv"
@@ -59,15 +32,12 @@ TRAIN_LOG_FILE = LOG_PATH / "training_data.csv"
 MODEL_META_PATH = LOG_PATH / "model_meta.json"
 MODEL_EVENT_LOG = LOG_PATH / "model_events.csv"
 
-# Plan log for dashboard (JSON lines)
 PLAN_LOG_FILE = LOG_PATH / "plan_log.jsonl"
 
-# Model version tracking
 MODEL_VERSION: int = 0
 LAST_TRAINED_SAMPLES: int = 0
-MIN_SAMPLES_FOR_RETRAIN: int = 50  # tweak for your project size
+MIN_SAMPLES_FOR_RETRAIN: int = 50  
 
-# Fixed schema for training_data.csv
 TRAIN_FIELDNAMES = [
     "ts_label",
     "label",
@@ -97,11 +67,9 @@ TRAIN_FIELDNAMES = [
 
 
 # --------------------------------------------------------------------------
-# Model metadata helpers
-# --------------------------------------------------------------------------
 
 def _load_model_meta() -> None:
-    """Load model version + last trained sample count from model_meta.json."""
+    
     global MODEL_VERSION, LAST_TRAINED_SAMPLES
     if MODEL_META_PATH.exists():
         try:
@@ -123,7 +91,7 @@ def _load_model_meta() -> None:
 
 
 def _save_model_meta() -> None:
-    """Persist model metadata."""
+    
     meta = {
         "version": MODEL_VERSION,
         "trained_on_samples": LAST_TRAINED_SAMPLES,
@@ -133,7 +101,7 @@ def _save_model_meta() -> None:
 
 
 def _log_model_event(event_type: str) -> None:
-    """Append a simple event line to model_events.csv."""
+    
     file_exists = MODEL_EVENT_LOG.exists()
     with MODEL_EVENT_LOG.open("a", newline="") as f:
         writer = csv.DictWriter(
@@ -153,7 +121,7 @@ def _log_model_event(event_type: str) -> None:
 
 
 def _count_training_samples() -> int:
-    """Return number of training rows in training_data.csv (excluding header)."""
+    
     if not TRAIN_LOG_FILE.exists():
         return 0
     n = 0
@@ -171,14 +139,7 @@ def _count_training_samples() -> int:
 
 
 def _maybe_retrain_model_from_training_csv() -> None:
-    """
-    Real training hook:
-
-    - Count rows in training_data.csv
-    - If count >= MIN_SAMPLES_FOR_RETRAIN and > LAST_TRAINED_SAMPLES:
-        * Train logistic regression from CSV
-        * If training succeeds, bump MODEL_VERSION and update metadata
-    """
+   
     global MODEL_VERSION, LAST_TRAINED_SAMPLES
 
     n_samples = _count_training_samples()
@@ -206,9 +167,6 @@ def _maybe_retrain_model_from_training_csv() -> None:
     print(f"[MODEL] RETRAINED → version={MODEL_VERSION}")
 
 
-# --------------------------------------------------------------------------
-# Main loop
-# --------------------------------------------------------------------------
 
 def main() -> None:
     recent_features: List[Dict[str, Any]] = []
@@ -274,18 +232,10 @@ def main() -> None:
         print("[BRAIN] Shutting down")
 
 
-# --------------------------------------------------------------------------
-# IP → approximate location (lat, lon)
-# --------------------------------------------------------------------------
-
 def _resolve_location_from_ip() -> Tuple[float, float]:
-    """
-    Use a free IP geolocation service to approximate the Pi's location.
-    Falls back to Toronto, Ontario if anything fails.
-    """
+   
     try:
         print("[BRAIN] Resolving location from IP...")
-        # ip-api.com: free, no key, HTTP only (fine for a course project)
         resp = requests.get("http://ip-api.com/json/", timeout=5)
         if resp.status_code == 200:
             data = resp.json()
@@ -307,27 +257,10 @@ def _resolve_location_from_ip() -> Tuple[float, float]:
     return FALLBACK_LAT, FALLBACK_LON
 
 
-# --------------------------------------------------------------------------
-# Outdoor weather via Open-Meteo (no key, free)
-# --------------------------------------------------------------------------
+
 
 def _fetch_outdoor_weather(lat: float, lon: float) -> Optional[Dict[str, float]]:
-    """
-    Fetch current outdoor temperature and humidity using the Open-Meteo API.
 
-    Uses the Forecast API with current weather variables:
-      - temperature_2m (°C)
-      - relative_humidity_2m (%)
-
-    Returns a sensor dict compatible with our pipeline, e.g.:
-
-        {
-          "temp_outdoor_c": 2.3,
-          "hum_outdoor_pct": 77.0
-        }
-
-    On failure, returns None and logs the error.
-    """
     url = "https://api.open-meteo.com/v1/forecast"
     params = {
         "latitude": lat,
@@ -362,9 +295,7 @@ def _fetch_outdoor_weather(lat: float, lon: float) -> Optional[Dict[str, float]]
         return None
 
 
-# --------------------------------------------------------------------------
-# Message handling / logging
-# --------------------------------------------------------------------------
+
 
 def _handle_message(message: Dict[str, Any], recent_features: List[Dict[str, Any]]) -> None:
     """Process incoming feature or actuation messages."""
@@ -377,18 +308,7 @@ def _handle_message(message: Dict[str, Any], recent_features: List[Dict[str, Any
 
 
 def _handle_feature(message: Dict[str, Any], recent_features: List[Dict[str, Any]]) -> None:
-    """
-    Handle an incoming sensor feature message from a node.
 
-    We:
-    - Normalize/attach a real timestamp.
-    - Append to the rolling 30-minute history.
-    - Log to CSV for offline analysis (sensor_log.csv) with a stable header
-      that includes ALL sensor keys we've ever seen (including weather).
-    - If node == 'camera', also build a training row and maybe retrain the model.
-    """
-    # Normalize timestamp: if 'ts' looks like a real Unix timestamp (seconds), use it;
-    # otherwise, replace with the current wall-clock time.
     raw_ts = message.get("ts")
     if isinstance(raw_ts, (int, float)) and raw_ts > 10_000_000:
         msg_time = float(raw_ts)
@@ -416,18 +336,11 @@ def _handle_feature(message: Dict[str, Any], recent_features: List[Dict[str, Any
 
 
 def _log_feature_to_csv(message: Dict[str, Any]) -> None:
-    """
-    Append a flattened version of the feature message to sensor_log.csv.
-
-    This implementation guarantees that ALL sensor keys we've ever seen
-    (including temp_outdoor_c, hum_outdoor_pct, etc.) appear as columns,
-    by rewriting the CSV header if new keys appear later.
-    """
+   
     node = message.get("node", "unknown")
     ts = message.get("ts", time.time())
     sensors = message.get("sensors", {})
 
-    # Flatten sensors into s_<name> columns
     row: Dict[str, Any] = {
         "ts": ts,
         "node": node,
@@ -500,12 +413,7 @@ def _build_training_example_from_context(
     camera_msg: Dict[str, Any],
     recent_features: List[Dict[str, Any]],
 ) -> Optional[Dict[str, Any]]:
-    """
-    Build a single training example row given a camera label and
-    existing recent_features context.
 
-    Returns a dict with keys TRAIN_FIELDNAMES or None if we can't build it.
-    """
     sensors = camera_msg.get("sensors", {})
     ts_label = float(camera_msg.get("ts", time.time()))
 
@@ -638,18 +546,7 @@ def _handle_camera_label(
 # --------------------------------------------------------------------------
 
 def _handle_actuation_intent(message: Dict[str, Any]) -> None:
-    """
-    Handle an actuation intent message from a node.
 
-    Example message:
-    {
-        "node": "bedside",
-        "desired": {
-            "bedside_lamp": "off",
-            "humidifier": "on"
-        }
-    }
-    """
     desired = message.get("desired", {})
     node = message.get("node", "unknown")
     print(f"[BRAIN] Actuation intent from {node}")

@@ -1,6 +1,3 @@
-"""
-Lightweight TCP server for newline-delimited JSON messages between the Pi and ESP32 nodes.
-"""
 
 from __future__ import annotations
 
@@ -20,7 +17,6 @@ _server_socket: Optional[socket.socket] = None
 
 
 def _recv_lines(sock: socket.socket):
-    """Yield complete lines (bytes) from a socket using newline as delimiter."""
     buffer = b""
     while True:
         try:
@@ -87,7 +83,6 @@ def _accept_loop(server_sock: socket.socket) -> None:
 
 
 def start_server(host: str = HOST, port: int = PORT) -> None:
-    """Start the TCP server and begin accepting clients in background threads."""
     global _server_socket
     if _server_socket is not None:
         return
@@ -102,7 +97,6 @@ def start_server(host: str = HOST, port: int = PORT) -> None:
 
 
 def get_next_message(timeout: Optional[float] = None) -> Optional[Dict[str, Any]]:
-    """Fetch the next parsed message from the queue, or None if timed out."""
     try:
         return _message_queue.get(timeout=timeout)
     except Empty:
@@ -118,7 +112,6 @@ def _send(sock: socket.socket, message: Dict[str, Any]) -> None:
 
 
 def send_to_node(node_name: str, message: Dict[str, Any]) -> bool:
-    """Send a message to a specific node; returns True on success."""
     with _node_lock:
         sock = node_sockets.get(node_name)
     if not sock:
@@ -130,7 +123,6 @@ def send_to_node(node_name: str, message: Dict[str, Any]) -> bool:
 
 
 def broadcast(message: Dict[str, Any]) -> None:
-    """Send a message to all connected nodes."""
     with _node_lock:
         sockets = list(node_sockets.items())
     for node_name, sock in sockets:

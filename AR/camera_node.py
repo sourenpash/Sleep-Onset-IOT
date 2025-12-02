@@ -8,10 +8,10 @@ import mediapipe as mp
 from mediapipe.framework.formats import landmark_pb2
 
 # ==== CONFIGURE THESE ====
-SERVER_IP = "10.0.0.32"  # <-- your PC IP (same as ESP32 uses)
+SERVER_IP = "10.0.0.32"  # SERVER/PC IP ADDRESS
 SERVER_PORT = 5000
 
-CAMERA_INDEX = 0           # 0 = default webcam
+CAMERA_INDEX = 0           
 UPDATE_INTERVAL_SEC = 10.0 # how often to send an activity message
 # ==========================
 
@@ -27,12 +27,7 @@ def classify_activity(
     frame_height: int,
     no_person_secs: float,
 ) -> Tuple[str, float]:
-    """
-    Simple rule-based classifier using pose landmarks over the entire frame.
 
-    Returns:
-      (activity_state, confidence)
-    """
     # If no landmarks for some time, we treat as AWAY
     if landmarks is None:
         if no_person_secs > 10.0:

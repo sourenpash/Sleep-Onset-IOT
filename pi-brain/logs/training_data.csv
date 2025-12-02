@@ -211,3 +211,13 @@ ts_label,label,label_conf,temp_win_c,hum_win_pct,light_win_lux,temp_bed_c,hum_be
 1764406177.186804,AWAY,nan,23.42,44.78,nan,23.3,46.37,7.5,nan,27.28,34.7,0.456,1.242,-3.5,75.0
 1764406187.188278,AWAY,nan,23.43,44.83,nan,23.3,46.36,7.5,nan,27.28,34.7,0.419,1.241,-3.5,75.0
 1764406197.1950474,AWAY,nan,23.43,44.9,nan,23.3,46.35,7.5,nan,27.28,34.7,0.564,1.238,-3.5,75.0
+1764408210.9303284,AWAKE_IN_ROOM,nan,nan,nan,nan,23.3,46.34,0.8,nan,nan,nan,nan,nan,-4.5,69.0
+1764408220.941168,AWAKE_IN_ROOM,nan,23.5,44.3,nan,23.27,46.38,0.8,nan,28.18,34.7,0.087,0.264,-4.5,69.0
+1764408230.947428,AWAKE_IN_ROOM,nan,23.5,44.3,nan,23.25,46.4,0.8,nan,27.96,34.6,0.099,0.266,-4.5,69.0
+1764408240.9504757,AWAKE_IN_ROOM,nan,23.5,44.3,nan,23.25,46.4,0.8,nan,27.96,34.6,0.099,0.266,-4.5,69.0
+1764408250.978572,AWAKE_IN_ROOM,nan,23.5,44.3,nan,23.25,46.4,0.8,nan,27.96,34.6,0.099,0.266,-4.5,69.0
+1764408340.3659136,AWAKE_IN_ROOM,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,-4.5,69.0
+1764408350.3705032,AWAKE_IN_ROOM,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,-4.5,69.0
+1764408360.3855705,IN_BED_LYING,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,-4.5,69.0
+1764408370.4034965,IN_BED_LYING,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,-4.5,69.0
+1764408380.446974,IN_BED_LYING,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,-4.5,69.0

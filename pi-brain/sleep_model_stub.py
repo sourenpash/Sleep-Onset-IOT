@@ -49,13 +49,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-# ---------------------------------------------------------------------------
-# Feature configuration
-# ---------------------------------------------------------------------------
-
-# These names must match BOTH:
-#   - columns in training_data.csv
-#   - sensor keys used on the ESP32 nodes
 FEATURE_NAMES = [
     # Window node
     "temp_win_c",
@@ -120,14 +113,7 @@ MAX_PREDICTION_WINDOW_S = 2 * 3600.0  # clamp horizon to 2h
 # ---------------------------------------------------------------------------
 
 def _label_to_target(label: str) -> Optional[int]:
-    """
-    Map a camera label string to binary target:
 
-        1 = "sleep / in bed"
-        0 = "awake / out of bed"
-
-    You can extend this as you refine camera classes.
-    """
     if not label:
         return None
     u = str(label).upper()
@@ -152,29 +138,7 @@ def train_model_from_csv(
     model_out_path: Path = DEFAULT_MODEL_PATH,
     min_conf: float = 0.5,
 ) -> bool:
-    """
-    Train a logistic regression model from training_data.csv.
 
-    - Inputs: FEATURE_NAMES as features.
-    - Target: camera label mapped by _label_to_target.
-    - Filters:
-        * rows where label can't be mapped
-        * rows where label_conf < min_conf (if provided)
-    - Handles NaNs via per-feature mean imputation + standardization.
-
-    Saves model JSON:
-      {
-        "feature_names": [...],
-        "mean": [...],
-        "std": [...],
-        "weights": [...],
-        "bias": float,
-        "trained_at": <ts>,
-        "n_samples": int
-      }
-
-    Returns True if training succeeded and model was saved, False otherwise.
-    """
     if not csv_path.exists():
         print(f"[MODEL] No training CSV at {csv_path}, cannot train.")
         return False
@@ -277,7 +241,6 @@ def _train_logistic_gradient_descent(
     lr: float = 0.05,
     n_iter: int = 500,
 ) -> Tuple[np.ndarray, float]:
-    """Basic logistic regression training via batch gradient descent."""
     N, D = X.shape
     w = np.zeros(D, dtype=float)
     b = 0.0
@@ -311,7 +274,6 @@ def _load_model(model_path: Path = DEFAULT_MODEL_PATH) -> Optional[Dict[str, Any
 
 
 def _load_dyn_state(path: Path = DYN_STATE_PATH) -> Dict[str, Any]:
-    """Load or initialize ODE time constants."""
     if path.exists():
         try:
             data = json.loads(path.read_text())
@@ -322,7 +284,6 @@ def _load_dyn_state(path: Path = DYN_STATE_PATH) -> Dict[str, Any]:
             }
         except Exception as e:
             print(f"[DYN] Failed to load dynamics state: {e}")
-    # defaults ~15 min time constant
     return {
         "tau_temp_s": 900.0,
         "tau_hum_s": 900.0,
@@ -348,7 +309,6 @@ def _latest_msg_for_node(
     max_age_sec: float,
     ref_ts: float,
 ) -> Optional[Dict[str, Any]]:
-    """Return latest message for node within max_age_sec of ref_ts."""
     for msg in reversed(recent_features):
         if msg.get("node") != node_name:
             continue
@@ -366,12 +326,6 @@ def _extract_feature_vector_from_recent(
     feature_names: List[str],
     max_age_sec: float = 120.0,
 ) -> Tuple[Optional[np.ndarray], Dict[str, Any]]:
-    """
-    Build a feature vector in the same order as feature_names from recent_features.
-
-    Returns:
-      (x, debug_dict) where x is (D,) or None if we have zero information.
-    """
     if not recent_features:
         return None, {}
 
@@ -417,7 +371,6 @@ def _latest_camera_info(
     recent_features: List[Dict[str, Any]],
     max_age_sec: float = 60.0,
 ) -> Tuple[Optional[str], Optional[float], Optional[float]]:
-    """Return (label, conf, age_s) from latest camera message, or (None, None, None)."""
     if not recent_features:
         return None, None, None
 
@@ -428,7 +381,6 @@ def _latest_camera_info(
 
     sensors = cam_msg.get("sensors", {})
 
-    # 1) Try explicit keys first
     label = (
         sensors.get("state")
         or sensors.get("label")
@@ -445,7 +397,6 @@ def _latest_camera_info(
         or sensors.get("score")
     )
 
-    # 2) If still no label, scan for any key that *looks* like a label/state
     if label is None:
         for k, v in sensors.items():
             if not isinstance(v, str):
@@ -478,7 +429,6 @@ def _extract_time_series(
     key: str,
     max_age_sec: float = 1800.0,  # up to 30 min
 ) -> List[Tuple[float, float]]:
-    """Return list of (ts, value) for the given node/key within max_age_sec."""
     series: List[Tuple[float, float]] = []
     now = time.time()
     for msg in recent_features:
@@ -504,13 +454,6 @@ def _estimate_tau_from_series(
     series: List[Tuple[float, float]],
     eq_series: List[Tuple[float, float]],
 ) -> Optional[float]:
-    """
-    Estimate a first-order time constant tau from two-sample dynamics:
-
-      dX/dt = -(X - X_eq) / tau
-
-    Using the last two samples and approximate equilibrium X_eq from weather.
-    """
     if len(series) < 2 or len(eq_series) == 0:
         return None
 
@@ -553,7 +496,6 @@ def _update_dyn_state_from_recent(
     recent_features: List[Dict[str, Any]],
     dyn_state: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Update tau_temp_s and tau_hum_s based on recent history."""
     temp_series = _extract_time_series(recent_features, "bedside", "temp_bed_c")
     hum_series = _extract_time_series(recent_features, "bedside", "hum_bed_pct")
     temp_out_series = _extract_time_series(recent_features, "weather", "temp_outdoor_c")
@@ -585,17 +527,6 @@ def _predict_time_to_target(
     eq_val: Optional[float],
     tau: float,
 ) -> Optional[float]:
-    """
-    Solve for t in a first-order approach to target:
-
-      X(t) = X_eq + (X0 - X_eq) * exp(-t / tau)
-
-    Given X(0)=current, X_eq=eq_val, want X(t)=target.
-
-      t = -tau * ln( (target - X_eq) / (current - X_eq) )
-
-    Returns t (seconds) or None if not solvable.
-    """
     if current is None or eq_val is None:
         return None
     if not (math.isfinite(current) and math.isfinite(eq_val)):
@@ -625,7 +556,6 @@ def _predict_env_at_time(
     tau: float,
     t: float,
 ) -> Optional[float]:
-    """X(t) = X_eq + (X0 - X_eq) * exp(-t / tau)"""
     if current is None or eq_val is None:
         return None
     if not (math.isfinite(current) and math.isfinite(eq_val)):
@@ -642,9 +572,6 @@ def _predict_prob_sleep(
     model: Dict[str, Any],
     x_raw: np.ndarray,
 ) -> float:
-    """
-    Apply normalization + logistic model to a single feature vector x_raw (D,).
-    """
     means = np.asarray(model["mean"], dtype=float)
     stds = np.asarray(model["std"], dtype=float)
     w = np.asarray(model["weights"], dtype=float)
@@ -756,7 +683,7 @@ def compute_sleep_plan(
             x_future[idx_hum_bed] = H_future
             feats_future["hum_bed_pct"] = H_future
 
-    # 6) Model probability (if available)
+    # 6) Model probability 
     p_sleep_model = None
     model_reason = ""
     if model is not None and x_future is not None:

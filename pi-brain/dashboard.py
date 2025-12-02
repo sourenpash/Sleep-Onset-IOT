@@ -1,27 +1,4 @@
-"""
-dashboard.py
 
-Live dashboard for the sleep-env project.
-
-Tabs:
-  1) Overview
-     - Current global sleep state / probabilities.
-     - Latest per-node sensor values (window / bedside / door / camera / weather).
-  2) Model Internals
-     - Features fed into logistic regression (current + ODE-predicted future).
-     - Logistic regression output p_sleep_model.
-     - ODE parameters (tau_temp_s, tau_hum_s, cooldown_time_s, targets).
-     - Training/model status (version, # training samples).
-
-Data sources (all written by brain_server.py):
-  - logs/sensor_log.csv       : flattened sensor features by node.
-  - logs/plan_log.jsonl       : one JSON sleep plan per line.
-  - logs/model_meta.json      : model_version + trained_on_samples.
-  - logs/training_data.csv    : camera-labelled training rows.
-
-This dashboard is read-only: it does NOT send any commands back to the ESP32s
-yet. Calibration / remote control could be built on top of this.
-"""
 
 from __future__ import annotations
 
@@ -33,9 +10,6 @@ from typing import Any, Dict, List, Optional
 
 import PySimpleGUI as sg
 
-# ---------------------------------------------------------------------------
-# Paths
-# ---------------------------------------------------------------------------
 
 LOG_DIR = Path("logs")
 SENSOR_LOG_FILE = LOG_DIR / "sensor_log.csv"
@@ -78,9 +52,6 @@ FEATURE_DISPLAY_NAMES: Dict[str, str] = {
     "hum_outdoor_pct": "Outdoor humidity (%)",
 }
 
-# ---------------------------------------------------------------------------
-# Helpers to read logs
-# ---------------------------------------------------------------------------
 
 def _safe_float(x: Any) -> Optional[float]:
     try:
@@ -92,19 +63,7 @@ def _safe_float(x: Any) -> Optional[float]:
 
 
 def read_latest_sensor_rows() -> Dict[str, Dict[str, Any]]:
-    """
-    Read sensor_log.csv and return latest row per node.
 
-    Returns:
-        {
-          "bedside": {"ts": ..., "sensors": {"temp_bed_c": ..., ...}},
-          "window": {...},
-          "door": {...},
-          "camera": {...},
-          "weather": {...},
-          ...
-        }
-    """
     if not SENSOR_LOG_FILE.exists():
         return {}
 
@@ -142,7 +101,6 @@ def read_latest_sensor_rows() -> Dict[str, Dict[str, Any]]:
 
 
 def read_latest_plan() -> Optional[Dict[str, Any]]:
-    """Return the last JSON object from plan_log.jsonl, or None."""
     if not PLAN_LOG_FILE.exists():
         return None
 
@@ -164,7 +122,6 @@ def read_latest_plan() -> Optional[Dict[str, Any]]:
 
 
 def read_model_meta() -> Dict[str, Any]:
-    """Load model_meta.json, or defaults if missing."""
     if not MODEL_META_FILE.exists():
         return {
             "version": 0,
@@ -183,12 +140,7 @@ def read_model_meta() -> Dict[str, Any]:
 
 
 def read_training_stats() -> Dict[str, Any]:
-    """
-    Very small summary of training_data.csv:
-      - n_rows
-      - last_label
-      - last_ts
-    """
+   
     if not TRAIN_DATA_FILE.exists():
         return {
             "n_rows": 0,

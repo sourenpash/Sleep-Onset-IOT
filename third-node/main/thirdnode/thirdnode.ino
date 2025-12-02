@@ -4,8 +4,8 @@
 #include <math.h>
 
 #include <Adafruit_Sensor.h>
-#include <Adafruit_ADS1X15.h>          // ADS1015
-#include "Adafruit_BME680.h"           // BME680
+#include <Adafruit_ADS1X15.h>          
+#include "Adafruit_BME680.h"           
 
 // BLE
 #include <BLEDevice.h>
@@ -13,61 +13,44 @@
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
 
-// ----------------------------------------------------------------------
-// WiFi / server config
-// ----------------------------------------------------------------------
-const char* WIFI_SSID     = "Mehrali68";
-const char* WIFI_PASSWORD = "4165659393";
+const char* WIFI_SSID     = "";
+const char* WIFI_PASSWORD = "";
 
 const char* SERVER_IP     = "10.0.0.32";
 const uint16_t SERVER_PORT = 5000;
 
-const char* NODE_ID       = "door";        // JSON node name
-const char* NODE_BLE_NAME = "door-node";   // BLE advertised name
+const char* NODE_ID       = "door";        
+const char* NODE_BLE_NAME = "door-node";   
 
-// These must match NODE_BLE_NAME used on your other two ESP32s
 const char* PEER1_NAME    = "window-node";
 const char* PEER2_NAME    = "bed-node";
 
 WiFiClient client;
 
-// how often to send a feature message (ms)
 const unsigned long FEATURE_INTERVAL_MS = 10UL * 1000UL;
 unsigned long lastFeatureMillis  = 0;
 
 String rxBuffer;
 
-// ----------------------------------------------------------------------
-// I2C + sensors
-// ----------------------------------------------------------------------
-// I2C0 on SDA=16, SCL=15 (BME680, ADS1015)
 Adafruit_BME680 bme;
 Adafruit_ADS1015 ads;
 
-// Flags
 bool bme_ok  = false;
 bool ads_ok  = false;
 
-// (kept in case you later want multi-sample noise stats)
 const int MIC_SAMPLES = 40;
 
-// ----------------------------------------------------------------------
-// BLE globals / config
-// ----------------------------------------------------------------------
 BLEScan*        pBLEScan      = nullptr;
 BLEAdvertising* pAdvertising  = nullptr;
 const int BLE_SCAN_TIME_SEC   = 2;
 const int RSSI_INVALID        = -999;
 
 const unsigned long BLE_SCAN_INTERVAL_MS = 5UL * 60UL * 1000UL;
-unsigned long lastBleScanMillis = 0;   // 0 => never scanned yet
+unsigned long lastBleScanMillis = 0;   
 
 int lastPeer1Rssi = RSSI_INVALID;
 int lastPeer2Rssi = RSSI_INVALID;
 
-// ----------------------------------------------------------------------
-// Sample struct (minimal: temp, hum, mic, light)
-// ----------------------------------------------------------------------
 struct DoorSample {
   float temp_c;
   float hum_pct;
@@ -75,9 +58,6 @@ struct DoorSample {
   float light_v;
 };
 
-// ----------------------------------------------------------------------
-// Simple 1D Kalman filter for scalar signals
-// ----------------------------------------------------------------------
 struct Kalman1D {
   float x;          // state estimate
   float P;          // estimate covariance
@@ -90,7 +70,6 @@ struct Kalman1D {
 
   float update(float z) {
     if (isnan(z)) {
-      // Don't update on invalid measurement, just return previous estimate (or NaN if never init)
       return initialized ? x : NAN;
     }
 
@@ -101,10 +80,8 @@ struct Kalman1D {
       return x;
     }
 
-    // Predict
     P += Q;
 
-    // Update
     float K = P / (P + R);
     x = x + K * (z - x);
     P = (1.0f - K) * P;
@@ -113,22 +90,120 @@ struct Kalman1D {
   }
 };
 
-// One Kalman filter per sensor signal
 Kalman1D kf_temp(0.01f, 0.25f);   // temperature: low noise
 Kalman1D kf_hum(0.01f, 1.0f);     // humidity
 Kalman1D kf_mic(0.1f, 10.0f);     // mic voltage (noisy)
 Kalman1D kf_light(0.05f, 5.0f);   // light voltage
 
-// ----------------------------------------------------------------------
-// Logging helper
-// ----------------------------------------------------------------------
+
+// Temperature at door (°C) from BME680
+float CAL_TEMP_DOOR_ACTUAL[3] = { 0.0f, 0.0f, 0.0f };   
+float CAL_TEMP_DOOR_RAW[3]    = { 0.0f, 0.0f, 0.0f };   
+
+// Humidity at door (%) from BME680
+float CAL_HUM_DOOR_ACTUAL[3] = { 0.0f, 0.0f, 0.0f };
+float CAL_HUM_DOOR_RAW[3]    = { 0.0f, 0.0f, 0.0f };
+
+// Microphone voltage (V) from ADS1015 CH0
+float CAL_MIC_ACTUAL[3] = { 0.0f, 0.0f, 0.0f };
+float CAL_MIC_RAW[3]    = { 0.0f, 0.0f, 0.0f };
+
+// Light voltage (V) from ADS1015 CH2
+float CAL_LIGHT_ACTUAL[3] = { 0.0f, 0.0f, 0.0f };
+float CAL_LIGHT_RAW[3]    = { 0.0f, 0.0f, 0.0f };
+
+// Calibration params: actual ≈ a * raw + b
+float calTempDoor_a = 1.0f, calTempDoor_b = 0.0f; bool calTempDoor_enabled = false;
+float calHumDoor_a  = 1.0f, calHumDoor_b  = 0.0f; bool calHumDoor_enabled  = false;
+float calMic_a      = 1.0f, calMic_b      = 0.0f; bool calMic_enabled      = false;
+float calLight_a    = 1.0f, calLight_b    = 0.0f; bool calLight_enabled    = false;
+
+// Generic least-squares line y = a x + b over up to n points
+// (actual[i], raw[i]) with (0,0) treated as "unused".
+void computeCalGeneric(const float actual[], const float raw[], int n,
+                       float &a, float &b, bool &enabled) {
+  float sumX = 0.0f, sumY = 0.0f, sumXX = 0.0f, sumXY = 0.0f;
+  int count = 0;
+
+  for (int i = 0; i < n; ++i) {
+    float ya = actual[i];
+    float xr = raw[i];
+
+    if (ya == 0.0f && xr == 0.0f) {
+      continue;
+    }
+    if (isnan(ya) || isnan(xr)) {
+      continue;
+    }
+
+    sumX  += xr;
+    sumY  += ya;
+    sumXX += xr * xr;
+    sumXY += xr * ya;
+    count++;
+  }
+
+  if (count == 0) {
+    a = 1.0f;
+    b = 0.0f;
+    enabled = false;
+    return;
+  }
+
+  float denom = (count * sumXX - sumX * sumX);
+  if (denom == 0.0f) {
+    a = 1.0f;
+    b = 0.0f;
+    enabled = false;
+    return;
+  }
+
+  a = (count * sumXY - sumX * sumY) / denom;
+  b = (sumY - a * sumX) / count;
+  enabled = true;
+}
+
+float applyCal(float raw, float a, float b, bool enabled) {
+  if (!enabled || isnan(raw)) return raw;
+  return a * raw + b;
+}
+
+void initCalibration() {
+  computeCalGeneric(CAL_TEMP_DOOR_ACTUAL, CAL_TEMP_DOOR_RAW, 3,
+                    calTempDoor_a, calTempDoor_b, calTempDoor_enabled);
+  computeCalGeneric(CAL_HUM_DOOR_ACTUAL,  CAL_HUM_DOOR_RAW,  3,
+                    calHumDoor_a,  calHumDoor_b,  calHumDoor_enabled);
+  computeCalGeneric(CAL_MIC_ACTUAL,       CAL_MIC_RAW,       3,
+                    calMic_a,      calMic_b,      calMic_enabled);
+  computeCalGeneric(CAL_LIGHT_ACTUAL,     CAL_LIGHT_RAW,     3,
+                    calLight_a,    calLight_b,    calLight_enabled);
+
+  Serial.println("[DOOR] Calibration init:");
+  Serial.print("  Temp_door: ");
+  Serial.print(calTempDoor_enabled ? "ON " : "OFF");
+  Serial.print(" a="); Serial.print(calTempDoor_a, 4);
+  Serial.print(" b="); Serial.println(calTempDoor_b, 4);
+
+  Serial.print("  Hum_door:  ");
+  Serial.print(calHumDoor_enabled ? "ON " : "OFF");
+  Serial.print(" a="); Serial.print(calHumDoor_a, 4);
+  Serial.print(" b="); Serial.println(calHumDoor_b, 4);
+
+  Serial.print("  Mic_v:     ");
+  Serial.print(calMic_enabled ? "ON " : "OFF");
+  Serial.print(" a="); Serial.print(calMic_a, 4);
+  Serial.print(" b="); Serial.println(calMic_b, 4);
+
+  Serial.print("  Light_v:   ");
+  Serial.print(calLight_enabled ? "ON " : "OFF");
+  Serial.print(" a="); Serial.print(calLight_a, 4);
+  Serial.print(" b="); Serial.println(calLight_b, 4);
+}
+
 void logLine(const String& msg) {
   Serial.println(msg);
 }
 
-// ----------------------------------------------------------------------
-// WiFi + TCP helpers
-// ----------------------------------------------------------------------
 void connectWifi() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -162,19 +237,14 @@ void sendHello() {
   logLine("[DOOR] Sent hello: " + hello);
 }
 
-// ----------------------------------------------------------------------
-// BLE init + scan
-// ----------------------------------------------------------------------
 void initBLE() {
   logLine("[DOOR] Initializing BLE...");
   BLEDevice::init(NODE_BLE_NAME);
 
-  // Advertise this node so others can see us
   pAdvertising = BLEDevice::getAdvertising();
   pAdvertising->start();
   logLine("[DOOR] BLE advertising started as: " + String(NODE_BLE_NAME));
 
-  // Prepare scanner to look for other ESP32 nodes
   pBLEScan = BLEDevice::getScan();
   pBLEScan->setActiveScan(true);
   pBLEScan->setInterval(100);
@@ -227,14 +297,9 @@ void scanForPeers(int& peer1Rssi, int& peer2Rssi) {
   }
 }
 
-// ----------------------------------------------------------------------
-// Sensor init
-// ----------------------------------------------------------------------
 void initSensors() {
-  // I2C bus (BME, ADC)
   Wire.begin(16, 15);
 
-  // BME680
   if (!bme.begin(0x76)) {
     Serial.println("Could not find a valid BME680 sensor, check wiring!");
     bme_ok = false;
@@ -242,13 +307,12 @@ void initSensors() {
     bme_ok = true;
     bme.setTemperatureOversampling(BME680_OS_8X);
     bme.setHumidityOversampling(BME680_OS_2X);
-    bme.setPressureOversampling(BME680_OS_4X);  // still configured but unused
+    bme.setPressureOversampling(BME680_OS_4X);  
     bme.setIIRFilterSize(BME680_FILTER_SIZE_3);
-    bme.setGasHeater(320, 150); // 320°C for 150 ms (unused, but fine)
+    bme.setGasHeater(320, 150); 
     Serial.println("[DOOR] BME680 initialized");
   }
 
-  // ADS1015
   if (!ads.begin()) {
     Serial.println("Failed to initialize ADS.");
     ads_ok = false;
@@ -258,9 +322,6 @@ void initSensors() {
   }
 }
 
-// ----------------------------------------------------------------------
-// Sample read + Kalman filtering (temp, hum, mic, light only)
-// ----------------------------------------------------------------------
 DoorSample readDoorSample() {
   DoorSample s;
   s.temp_c   = NAN;
@@ -268,40 +329,39 @@ DoorSample readDoorSample() {
   s.mic_v    = NAN;
   s.light_v  = NAN;
 
-  // BME680
   if (bme_ok) {
     if (bme.performReading()) {
       float raw_temp_c  = bme.temperature;
       float raw_hum_pct = bme.humidity;
 
-      s.temp_c  = kf_temp.update(raw_temp_c);
-      s.hum_pct = kf_hum.update(raw_hum_pct);
+      float temp_cal = applyCal(raw_temp_c,  calTempDoor_a, calTempDoor_b, calTempDoor_enabled);
+      float hum_cal  = applyCal(raw_hum_pct, calHumDoor_a,  calHumDoor_b,  calHumDoor_enabled);
+
+      s.temp_c  = kf_temp.update(temp_cal);
+      s.hum_pct = kf_hum.update(hum_cal);
     } else {
       Serial.println("[DOOR] BME680 performReading() failed");
     }
   }
 
-  // ADS1015: read channels, convert to volts, then filter
   if (ads_ok) {
-    int16_t mic_raw   = ads.readADC_SingleEnded(0);
-    // Channel 1 unused
-    int16_t light_raw = ads.readADC_SingleEnded(2);
+    int16_t mic_raw_counts   = ads.readADC_SingleEnded(0);
+    int16_t light_raw_counts = ads.readADC_SingleEnded(2);
 
-    float mic_v   = ads.computeVolts(mic_raw);
-    float light_v = ads.computeVolts(light_raw);
+    float mic_v_raw   = ads.computeVolts(mic_raw_counts);
+    float light_v_raw = ads.computeVolts(light_raw_counts);
 
-    s.mic_v   = kf_mic.update(mic_v);
-    s.light_v = kf_light.update(light_v);
+    float mic_v_cal   = applyCal(mic_v_raw,   calMic_a,   calMic_b,   calMic_enabled);
+    float light_v_cal = applyCal(light_v_raw, calLight_a, calLight_b, calLight_enabled);
+
+    s.mic_v   = kf_mic.update(mic_v_cal);
+    s.light_v = kf_light.update(light_v_cal);
   }
 
   return s;
 }
 
-// ----------------------------------------------------------------------
-// Feature send: env + BLE → JSON
-// ----------------------------------------------------------------------
 void sendFeature() {
-  // BLE scan (immediate the first time, then every 5 min)
   unsigned long now_ms = millis();
   if (lastBleScanMillis == 0 || now_ms - lastBleScanMillis >= BLE_SCAN_INTERVAL_MS) {
     logLine("[DOOR] Running BLE scan for peers...");
@@ -309,7 +369,6 @@ void sendFeature() {
     lastBleScanMillis = now_ms;
   }
 
-  // Read sensors (already Kalman-filtered)
   DoorSample env = readDoorSample();
 
   unsigned long ts = millis() / 1000UL;
@@ -317,11 +376,10 @@ void sendFeature() {
   String json = "{";
   json += "\"node\":\"";
   json += NODE_ID;
-  json += "\",";
+  json += "\","; 
   json += "\"ts\":" + String(ts) + ",";
-  json += "\"sensors\":{";
+  json += "\"sensors\":{"; 
 
-  // BME (filtered values)
   json += "\"temp_door_c\":";
   json += isnan(env.temp_c) ? "null" : String(env.temp_c, 2);
   json += ",";
@@ -354,9 +412,6 @@ void sendFeature() {
   logLine("[DOOR] Sent feature: " + json);
 }
 
-// ----------------------------------------------------------------------
-// Handle plan messages from brain
-// ----------------------------------------------------------------------
 void handleIncomingData() {
   while (client.available() > 0) {
     char c = (char)client.read();
@@ -385,13 +440,12 @@ void handleIncomingData() {
   }
 }
 
-// ----------------------------------------------------------------------
-// setup / loop
-// ----------------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
   delay(1000);
   logLine("[DOOR] Third node (door) starting...");
+
+  initCalibration();  
 
   initSensors();
   initBLE();
@@ -403,7 +457,7 @@ void setup() {
 
   sendHello();
   lastFeatureMillis  = millis();
-  lastBleScanMillis  = 0;  // force immediate first BLE scan
+  lastBleScanMillis  = 0;  
 }
 
 void loop() {

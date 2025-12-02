@@ -1,24 +1,3 @@
-"""
-kasa_control_stub.py
-
-Control Kasa-based actuators for:
-  - humidifier
-  - dehumidifier
-  - heater
-
-You can:
-  - import set_device_state / set_humidifier / set_dehumidifier / set_heater
-  - or run this file directly from the command line to test.
-
-Requires:
-    pip install python-kasa
-
-IMPORTANT:
-  - Each device ID below can be an IP ("10.0.0.xx") or an alias you set in
-    the Kasa app.
-  - The humidifier/dehumidifier/heater themselves must be left in an
-    "ON" state so that when the plug powers them they actually start running.
-"""
 
 from __future__ import annotations
 
@@ -27,22 +6,17 @@ import sys
 from typing import Dict
 
 try:
-    from kasa import SmartPlug  # python-kasa
+    from kasa import SmartPlug 
 except ImportError:
     SmartPlug = None
     print("[KASA] WARNING: python-kasa not installed. This stub will only print actions.")
 
 
-# ---------------------------------------------------------------------
-# CONFIG: set these to your actual devices
-# ---------------------------------------------------------------------
-# You can use either IPs or aliases here.
-HUMIDIFIER_DEVICE_ID   = "10.0.0.164"
-DEHUMIDIFIER_DEVICE_ID = "10.0.0.164"   # for now, same plug if you only have one
-HEATER_DEVICE_ID       = "10.0.0.164"   # same here, just for testing
-  # e.g. "10.0.0.62" or alias
 
-# Map logical names (what the brain server uses) -> physical device IDs
+HUMIDIFIER_DEVICE_ID   = "10.0.0.164"
+DEHUMIDIFIER_DEVICE_ID = "10.0.0.164"  
+HEATER_DEVICE_ID       = "10.0.0.164"   
+
 DEVICE_MAP: Dict[str, str] = {
     "humidifier":   HUMIDIFIER_DEVICE_ID,
     "dehumidifier": DEHUMIDIFIER_DEVICE_ID,
@@ -50,17 +24,10 @@ DEVICE_MAP: Dict[str, str] = {
 }
 
 
-# ---------------------------------------------------------------------
-# Core async helper
-# ---------------------------------------------------------------------
-
 async def _set_kasa_async(device_id: str, on: bool) -> None:
-    """
-    Async helper: connect to a Kasa plug and set on/off.
-    device_id can be an IP or an alias discoverable on the LAN.
-    """
+   
     if SmartPlug is None:
-        # python-kasa not available, just log
+       
         print(f"[KASA] (DRY RUN) {device_id}: would set to {'ON' if on else 'OFF'}")
         return
 
@@ -77,13 +44,11 @@ async def _set_kasa_async(device_id: str, on: bool) -> None:
 
 
 def _run_async(coro) -> None:
-    """
-    Run an async coroutine, handling the case where an event loop already exists.
-    """
+   
     try:
         asyncio.run(coro)
     except RuntimeError:
-        # if we're already inside an event loop, create a new one
+       
         loop = asyncio.new_event_loop()
         try:
             loop.run_until_complete(coro)
@@ -91,19 +56,8 @@ def _run_async(coro) -> None:
             loop.close()
 
 
-# ---------------------------------------------------------------------
-# Public API for brain_server and tests
-# ---------------------------------------------------------------------
-
 def set_device_state(name: str, on: bool) -> None:
-    """
-    Generic entry point. 'name' is a logical name:
-
-        'humidifier', 'dehumidifier', 'heater'
-
-    or a raw device ID (IP/alias).
-    """
-    # Map logical name to device_id, or treat name as device_id directly
+   
     device_id = DEVICE_MAP.get(name, name)
     print(f"[KASA] Request: {name} -> {device_id} = {'ON' if on else 'OFF'}")
     _run_async(_set_kasa_async(device_id, on))
@@ -120,10 +74,6 @@ def set_dehumidifier(on: bool) -> None:
 def set_heater(on: bool) -> None:
     set_device_state("heater", on)
 
-
-# ---------------------------------------------------------------------
-# CLI tester
-# ---------------------------------------------------------------------
 
 def _print_usage() -> None:
     print("Usage:")

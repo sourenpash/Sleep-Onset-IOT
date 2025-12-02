@@ -1,20 +1,4 @@
-"""
-env_map.py
 
-Builds simple 2D heatmaps (temperature, humidity, light) over the room
-using the latest readings from the ESP32 nodes as anchor points.
-
-Usage:
-  - As a module:
-      from env_map import build_env_maps, compute_bed_env
-
-  - As a script:
-      python env_map.py
-    This will:
-      * Reload logs/sensor_log.csv every ~N seconds
-      * Build env maps from the latest reading per node
-      * Show live-updating heatmaps for temperature, humidity, and light.
-"""
 
 from __future__ import annotations
 
@@ -26,9 +10,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import matplotlib.pyplot as plt
 
-# ----------------------------------------------------------------------
-# Room + anchor configuration
-# ----------------------------------------------------------------------
 
 # Rough room dimensions in meters
 ROOM_W = 4.0  # width (x-direction)
@@ -75,17 +56,7 @@ def _rssi_to_distance(
     rssi_at_1m: float = -60.0,
     path_loss: float = 2.0,
 ) -> Optional[float]:
-    """
-    Convert RSSI (dBm, negative) to approximate distance in meters using a
-    simple log-distance path loss model:
 
-      RSSI(d) = RSSI(1m) - 10 * n * log10(d)
-
-    => d = 10^((RSSI(1m) - RSSI(d)) / (10*n))
-
-    Returns:
-        distance in meters, or None if rssi is invalid.
-    """
     try:
         r = float(rssi)
     except Exception:
@@ -104,7 +75,6 @@ def _rssi_to_distance(
 def _latest_by_node(
     features: List[Dict[str, Any]], node_name: str
 ) -> Optional[Dict[str, Any]]:
-    """Return the most recent feature dict for the given node, or None."""
     for f in reversed(features):
         if f.get("node") == node_name:
             return f
@@ -114,20 +84,7 @@ def _latest_by_node(
 def _compute_node_positions_from_ble(
     recent_features: List[Dict[str, Any]],
 ) -> Dict[str, Tuple[float, float]]:
-    """
-    Infer relative 2D positions of window, bedside, and door from pairwise
-    BLE RSSI. Returns a mapping: node_name -> (x, y) in room coordinates.
-
-    Steps:
-      1) Build a symmetric pairwise distance matrix from ble_peer*_rssi.
-      2) Embed 3 nodes in 2D:
-           - Place node0 at (0, 0)
-           - Place node1 at (d01, 0)
-           - Place node2 from distances d02, d12 using circle intersection.
-      3) Affine-rescale the triangle to fill [0, ROOM_W] × [0, ROOM_H].
-
-    If BLE data is missing/incomplete, fall back to NODE_POSITIONS.
-    """
+   
     node_names = ["window", "bedside", "door"]
 
     # Latest messages for each node
@@ -229,24 +186,7 @@ def _compute_node_positions_from_ble(
 def build_env_maps(
     recent_features: List[Dict[str, Any]]
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Build environment heatmaps from the latest readings per node.
 
-    Args:
-        recent_features: list of messages as used in brain_server, each like:
-            {
-              "node": "bedside" or "window",
-              "ts": ...,
-              "sensors": { ... }
-            }
-
-    Returns:
-        grid_x: (GRID_NY, GRID_NX) array of x coordinates (meters)
-        grid_y: (GRID_NY, GRID_NX) array of y coordinates (meters)
-        temp_map: (GRID_NY, GRID_NX) array of temperature (°C) or NaN
-        hum_map:  (GRID_NY, GRID_NX) array of humidity (%) or NaN
-        light_map:(GRID_NY, GRID_NX) array of light (lux) or NaN
-    """
     anchors = _collect_anchors(recent_features)
 
     # Build grid of (x,y) coordinates
@@ -315,9 +255,7 @@ def sample_at_position(
     hum_map: np.ndarray,
     light_map: np.ndarray,
 ) -> Dict[str, float]:
-    """
-    Sample the environment maps at a given (x,y) position using bilinear interpolation.
-    """
+
     # Clamp x,y to room bounds
     x_clamped = np.clip(x, 0.0, ROOM_W)
     y_clamped = np.clip(y, 0.0, ROOM_H)
@@ -372,11 +310,7 @@ def sample_at_position(
 def compute_bed_env(
     recent_features: List[Dict[str, Any]]
 ) -> Dict[str, float]:
-    """
-    Convenience helper:
-      - Builds env maps from recent_features
-      - Samples them at the bed position (bedside node position, inferred from BLE)
-    """
+
     node_positions = _compute_node_positions_from_ble(recent_features)
     bed_pos = node_positions.get("bedside", POS_BED_DEFAULT)
 
@@ -390,7 +324,7 @@ def compute_bed_env(
 # ----------------------------------------------------------------------
 
 def _to_float_or_nan(val: Any) -> float:
-    """Convert a value to float, or NaN if not valid."""
+
     try:
         if val is None or (isinstance(val, str) and val.strip() == ""):
             return float("nan")
@@ -405,21 +339,7 @@ def _to_float_or_nan(val: Any) -> float:
 def _collect_anchors(
     recent_features: List[Dict[str, Any]]
 ) -> List[Dict[str, Any]]:
-    """
-    Collect anchor points from latest readings of each node.
-
-    Each anchor dict has:
-        {
-          "node": "window" or "bedside",
-          "pos": (x, y),
-          "temp": float or NaN,
-          "hum": float or NaN,
-          "light": float or NaN,
-        }
-
-    Positions are inferred from BLE if possible; otherwise we fall back
-    to static NODE_POSITIONS.
-    """
+   
     anchors: List[Dict[str, Any]] = []
 
     # Compute dynamic positions from BLE RSSI (or fallback)
@@ -476,17 +396,7 @@ def _collect_anchors(
 # ----------------------------------------------------------------------
 
 def load_latest_features_from_csv(csv_path: Path) -> List[Dict[str, Any]]:
-    """
-    Load sensor_log.csv and return a list of "feature" dicts,
-    keeping only the latest row per node.
-
-    Each returned dict is of the form:
-        {
-          "node": <str>,
-          "ts": <float>,
-          "sensors": { <name>: <value>, ... }
-        }
-    """
+   
     if not csv_path.exists():
         return []
 
@@ -526,12 +436,7 @@ def load_latest_features_from_csv(csv_path: Path) -> List[Dict[str, Any]]:
 # ----------------------------------------------------------------------
 
 def _run_live_view(update_interval_sec: float = 30.0) -> None:
-    """
-    Live heatmap visualization:
-      - reload logs/sensor_log.csv every update_interval_sec
-      - build env maps from latest readings per node
-      - update matplotlib figure with temp/hum/light heatmaps
-    """
+   
     if not LOG_FILE.exists():
         print(f"[ENV] Log file not found: {LOG_FILE}")
         print("      Start brain_server.py and ESP32 nodes first.")
@@ -597,6 +502,6 @@ def _run_live_view(update_interval_sec: float = 30.0) -> None:
 
 if __name__ == "__main__":
     try:
-        _run_live_view(update_interval_sec=30.0)  # change to 60.0 if you prefer 1 min
+        _run_live_view(update_interval_sec=30.0)  
     except KeyboardInterrupt:
         print("\n[ENV] Stopped by user.")
